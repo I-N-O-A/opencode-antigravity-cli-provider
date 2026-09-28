@@ -9,6 +9,7 @@ const HOST = "127.0.0.1"
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
+const conversations = new Map()
 
 const MIME_EXTENSIONS = new Map([
   ["image/png", ".png"], ["image/jpeg", ".jpg"], ["image/gif", ".gif"],
@@ -81,15 +82,17 @@ async function promptFrom(messages = [], attachmentDir) {
   return prompt.join("\n\n")
 }
 
-function runAgy(command, model, prompt, attachmentDir, signal, onStep = () => {}) {
+function runAgy(command, model, prompt, attachmentDir, signal, conversationId, onEvent = () => {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, [
+    const args = [
       "--model", model,
       "--add-dir", attachmentDir,
       "--input-format", "stream-json",
       "--output-format", "stream-json",
       "--print-timeout", "30m",
-    ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
+    ]
+    if (conversationId) args.push("--conversation", conversationId)
+    const child = spawn(command, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
     let stdout = ""
     let stderr = ""
     let result
@@ -108,8 +111,8 @@ function runAgy(command, model, prompt, attachmentDir, signal, onStep = () => {}
       if (!line.trim()) return
       try {
         const event = JSON.parse(line)
-        if (event.event === "step_update") onStep(event.step_update)
-        else if (event.event === "result") result = event.result
+        onEvent(event, line)
+        if (event.event === "result") result = event.result
       } catch {
         // Ignore non-JSON diagnostic lines; agy writes its machine stream as NDJSON.
       }
@@ -162,17 +165,6 @@ function writeSse(response, id, model, created, delta, finishReason = null) {
   response.write(`data: ${JSON.stringify(chunk(id, model, created, delta, finishReason))}\n\n`)
 }
 
-function progressFromStep(step = {}) {
-  if (step.step_type === "tool") {
-    const name = step.tool_name ?? step.tool_info?.name ?? "tool"
-    return `agy tool ${name}: ${step.state === "DONE" ? (step.tool_info?.error ? "failed" : "finished") : "running"}`
-  }
-  const subagents = step.subagent_info?.subagents
-  if (Array.isArray(subagents) && subagents.length) return `agy delegated to ${subagents.length} subagent(s)`
-  if (step.step_type === "checkpoint" && step.state === "ACTIVE") return "agy continuing its work"
-  return undefined
-}
-
 async function handle(request, response, command) {
   // Loopback is not an authentication boundary by itself. Refuse browser-origin
   // requests (including DNS-rebinding attempts) and unexpected Host headers.
@@ -211,6 +203,9 @@ async function handle(request, response, command) {
     return
   }
   const attachmentDir = await mkdtemp(join(tmpdir(), "agy-openai-attachments-"))
+  const sessionId = request.headers["x-opencode-session"]
+  const conversationKey = typeof sessionId === "string" ? `${sessionId}:${model}` : undefined
+  const conversationId = conversationKey ? conversations.get(conversationKey) : undefined
   const controller = new AbortController()
   response.once("close", () => {
     if (!response.writableEnded) controller.abort()
@@ -238,17 +233,25 @@ async function handle(request, response, command) {
   }
 
   try {
-    const prompt = await promptFrom(body.messages, attachmentDir)
-    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal, (step) => {
-      if (!stream || controller.signal.aborted || response.destroyed) return
-      if (step.step_type === "agent_response" && typeof step.text_delta === "string" && step.text_delta) {
-        streamedText = true
-        writeSse(response, id, model, created, { content: step.text_delta })
+    const messages = conversationId
+      ? body.messages.slice(Math.max(0, body.messages.map((message) => message.role).lastIndexOf("user")))
+      : body.messages
+    const prompt = await promptFrom(messages, attachmentDir)
+    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal, conversationId, (event, rawLine) => {
+      if (event.event === "result" && event.result?.conversation_id && conversationKey) {
+        conversations.set(conversationKey, event.result.conversation_id)
       }
-      const progress = progressFromStep(step)
-      if (progress) writeSse(response, id, model, created, { reasoning_content: `${progress}\n` })
+      if (!stream || controller.signal.aborted || response.destroyed) return
+      if (event.event === "step_update" && event.step_update?.step_type === "agent_response" && typeof event.step_update.text_delta === "string") {
+        streamedText ||= Boolean(event.step_update.text_delta)
+        if (event.step_update.text_delta) writeSse(response, id, model, created, { content: event.step_update.text_delta })
+      }
+      // Preserve every exact CLI event line in OpenCode's reasoning stream. Never
+      // summarize, redact, filter, or truncate; answer deltas are also streamed as text.
+      writeSse(response, id, model, created, { reasoning_content: `${rawLine}\n` })
     })
     if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
+    if (result.conversation_id && conversationKey) conversations.set(conversationKey, result.conversation_id)
     const text = result.response ?? ""
     if (!stream) {
       sendJson(response, 200, {
