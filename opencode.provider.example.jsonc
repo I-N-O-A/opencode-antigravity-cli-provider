@@ -11,6 +11,7 @@
       "models": {
         "gemini-3.8-flash-low": {
           "name": "Gemini 3.8 Flash (Low)",
+          "compatibility": { "reasoningField": "reasoning_content" },
           "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] },
           "limit": { "context": 1000000, "output": 65536 }
         }

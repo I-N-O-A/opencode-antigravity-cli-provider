@@ -81,7 +81,7 @@ async function promptFrom(messages = [], attachmentDir) {
   return prompt.join("\n\n")
 }
 
-function runAgy(command, model, prompt, attachmentDir, signal) {
+function runAgy(command, model, prompt, attachmentDir, signal, onStep = () => {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, [
       "--model", model,
@@ -94,29 +94,43 @@ function runAgy(command, model, prompt, attachmentDir, signal) {
     let stderr = ""
     let result
     let settled = false
+    const cleanup = () => signal?.removeEventListener("abort", abort)
     const fail = (error) => {
       if (settled) return
       settled = true
+      cleanup()
       child.kill()
       reject(error)
     }
     const abort = () => fail(signal.reason ?? new Error("Request aborted"))
     signal?.addEventListener("abort", abort, { once: true })
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk })
+    const handleLine = (line) => {
+      if (!line.trim()) return
+      try {
+        const event = JSON.parse(line)
+        if (event.event === "step_update") onStep(event.step_update)
+        else if (event.event === "result") result = event.result
+      } catch {
+        // Ignore non-JSON diagnostic lines; agy writes its machine stream as NDJSON.
+      }
+    }
+    child.stdout.setEncoding("utf8").on("data", (chunk) => {
+      stdout += chunk
+      let newline
+      while ((newline = stdout.indexOf("\n")) !== -1) {
+        handleLine(stdout.slice(0, newline).replace(/\r$/, ""))
+        stdout = stdout.slice(newline + 1)
+      }
+    })
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk })
     child.stdin.on("error", fail)
     child.stdin.end(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n")
     child.once("error", fail)
     child.once("close", (code) => {
-      signal?.removeEventListener("abort", abort)
+      cleanup()
       if (settled) return
       settled = true
-      for (const line of stdout.split(/\r?\n/)) {
-        try {
-          const event = JSON.parse(line)
-          if (event.event === "result") result = event.result
-        } catch {}
-      }
+      handleLine(stdout)
       if (code !== 0 || result?.status !== "SUCCESS") {
         reject(new Error(result?.error || stderr.trim() || `agy exited with code ${code}`))
         return
@@ -134,14 +148,29 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body))
 }
 
-function chunk(id, model, created, content, finishReason = null) {
+function chunk(id, model, created, delta = {}, finishReason = null) {
   return {
     id,
     object: "chat.completion.chunk",
     created,
     model,
-    choices: [{ index: 0, delta: content === undefined ? {} : { content }, finish_reason: finishReason }],
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
   }
+}
+
+function writeSse(response, id, model, created, delta, finishReason = null) {
+  response.write(`data: ${JSON.stringify(chunk(id, model, created, delta, finishReason))}\n\n`)
+}
+
+function progressFromStep(step = {}) {
+  if (step.step_type === "tool") {
+    const name = step.tool_name ?? step.tool_info?.name ?? "tool"
+    return `agy tool ${name}: ${step.state === "DONE" ? (step.tool_info?.error ? "failed" : "finished") : "running"}`
+  }
+  const subagents = step.subagent_info?.subagents
+  if (Array.isArray(subagents) && subagents.length) return `agy delegated to ${subagents.length} subagent(s)`
+  if (step.step_type === "checkpoint" && step.state === "ACTIVE") return "agy continuing its work"
+  return undefined
 }
 
 async function handle(request, response, command) {
@@ -187,13 +216,41 @@ async function handle(request, response, command) {
     if (!response.writableEnded) controller.abort()
   })
 
+  const stream = Boolean(body.stream)
+  const id = `chatcmpl-${randomUUID()}`
+  const created = Math.floor(Date.now() / 1000)
+  let heartbeat
+  let streamedText = false
+  if (stream) {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    })
+    response.flushHeaders()
+    writeSse(response, id, model, created, { role: "assistant" })
+    // Keep intermediaries from closing a long-running CLI request during quiet tool work.
+    heartbeat = setInterval(() => {
+      if (!response.destroyed) response.write(": agy-working\n\n")
+    }, 10_000)
+    heartbeat.unref?.()
+  }
+
   try {
     const prompt = await promptFrom(body.messages, attachmentDir)
-    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal)
-    const id = `chatcmpl-${result.conversation_id ?? randomUUID()}`
-    const created = Math.floor(Date.now() / 1000)
+    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal, (step) => {
+      if (!stream || controller.signal.aborted || response.destroyed) return
+      if (step.step_type === "agent_response" && typeof step.text_delta === "string" && step.text_delta) {
+        streamedText = true
+        writeSse(response, id, model, created, { content: step.text_delta })
+      }
+      const progress = progressFromStep(step)
+      if (progress) writeSse(response, id, model, created, { reasoning_content: `${progress}\n` })
+    })
+    if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
     const text = result.response ?? ""
-    if (!body.stream) {
+    if (!stream) {
       sendJson(response, 200, {
         id,
         object: "chat.completion",
@@ -209,26 +266,20 @@ async function handle(request, response, command) {
       return
     }
 
-    response.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    })
-    response.write(`data: ${JSON.stringify(chunk(id, model, created, ""))}\n\n`)
-    for (let offset = 0; offset < text.length; offset += 96) {
-      if (controller.signal.aborted || response.destroyed) return
-      response.write(`data: ${JSON.stringify(chunk(id, model, created, text.slice(offset, offset + 96)))}\n\n`)
-    }
-    response.write(`data: ${JSON.stringify(chunk(id, model, created, undefined, "stop"))}\n\n`)
+    if (!streamedText && text) writeSse(response, id, model, created, { content: text })
+    clearInterval(heartbeat)
+    writeSse(response, id, model, created, {}, "stop")
     response.end("data: [DONE]\n\n")
   } catch (error) {
     if (response.headersSent) {
+      clearInterval(heartbeat)
       response.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
       response.end("data: [DONE]\n\n")
     } else {
       sendJson(response, 502, { error: { message: error.message } })
     }
   } finally {
+    clearInterval(heartbeat)
     await rm(attachmentDir, { recursive: true, force: true })
   }
 }
