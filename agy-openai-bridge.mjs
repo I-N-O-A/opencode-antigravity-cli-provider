@@ -9,8 +9,10 @@ const HOST = "127.0.0.1"
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
-const conversations = new Map()
+const agySessions = new Map()
+const agyChildren = new Set()
 const pendingActivities = new Map()
+const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000
 
 const MIME_EXTENSIONS = new Map([
   ["image/png", ".png"], ["image/jpeg", ".jpg"], ["image/gif", ".gif"],
@@ -40,9 +42,21 @@ async function saveAttachment(part, directory) {
   const match = /^data:([^;,]+)?;base64,([\s\S]*)$/i.exec(url)
   if (!match) throw new Error("Only base64 data-URI attachments can be forwarded to agy")
   const mime = (match[1] || part.mimeType || part.mime_type || "application/octet-stream").toLowerCase()
-  const extension = MIME_EXTENSIONS.get(mime) ?? extname(part.filename ?? part.name ?? "")
-  const filePath = join(directory, `${randomUUID()}${extension || ".bin"}`)
-  const file = await open(filePath, "w")
+  const originalName = String(part.filename ?? part.name ?? "").split(/[\\/]/).pop() ?? ""
+  const safeName = originalName.replace(/[<>:"|?*\x00-\x1f]/g, "_").replace(/\s+/g, "_").trim()
+  const extension = MIME_EXTENSIONS.get(mime) ?? extname(safeName)
+  const fileName = safeName
+    ? (extname(safeName) ? safeName : `${safeName}${extension || ".bin"}`)
+    : `${randomUUID()}${extension || ".bin"}`
+  let filePath = join(directory, fileName)
+  let file
+  try {
+    file = await open(filePath, "wx")
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error
+    filePath = join(directory, `${randomUUID()}-${fileName}`)
+    file = await open(filePath, "wx")
+  }
   try {
     const encoded = match[2]
     const chunkSize = 256 * 1024 // multiple of four so base64 groups are never split
@@ -61,88 +75,191 @@ async function saveAttachment(part, directory) {
 }
 
 async function promptFrom(messages = [], attachmentDir) {
-  const prompt = []
-  for (const message of messages) {
-    const sections = []
-    if (typeof message.content === "string") sections.push(message.content)
-    else if (Array.isArray(message.content)) {
-      for (const part of message.content) {
-        if (typeof part.text === "string") sections.push(part.text)
-        else if (["image_url", "image", "input_image", "file", "input_file"].includes(part.type)) {
-          const attachment = await saveAttachment(part, attachmentDir)
-          if (attachment) sections.push(`Attached ${attachment.mime} file: @${attachment.filePath}`)
-          else {
-            const url = attachmentUrl(part)
-            if (url) sections.push(`Attached file URL: ${url}`)
-          }
+  // AGY gets the user's actual latest turn; OpenCode system messages and
+  // transcript history are not rephrased or pasted into this human-facing text.
+  const message = [...messages].reverse().find((item) => item.role === "user")
+  if (!message) throw new Error("OpenCode request did not contain a user message")
+
+  const text = []
+  const attachments = []
+  if (typeof message.content === "string") text.push(message.content)
+  else if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (typeof part.text === "string") text.push(part.text)
+      else if (["image_url", "image", "input_image", "file", "input_file"].includes(part.type)) {
+        const attachment = await saveAttachment(part, attachmentDir)
+        if (attachment) attachments.push(`@${attachment.filePath}`)
+        else {
+          const url = attachmentUrl(part)
+          if (url) attachments.push(url)
         }
       }
     }
-    prompt.push(`--- ${message.role ?? "user"} ---\n${sections.join("\n")}`)
   }
-  return prompt.join("\n\n")
+
+  const prompt = text.join("")
+  if (!attachments.length) return prompt
+  return prompt ? `${prompt}\n\n${attachments.join("\n")}` : attachments.join("\n")
 }
 
-function runAgy(command, model, prompt, attachmentDir, signal, conversationId, onEvent = () => {}) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "--model", model,
-      "--add-dir", attachmentDir,
-      "--input-format", "stream-json",
-      "--output-format", "stream-json",
-      "--print-timeout", "30m",
-    ]
-    if (conversationId) args.push("--conversation", conversationId)
-    const child = spawn(command, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
-    let stdout = ""
-    let stderr = ""
-    let result
-    let settled = false
-    const cleanup = () => signal?.removeEventListener("abort", abort)
-    const fail = (error) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      child.kill()
-      reject(error)
+function createAgySession(command, model, key, attachmentDir) {
+  const args = [
+    "--model", model,
+    "--add-dir", attachmentDir,
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+  ]
+  const child = spawn(command, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
+  agyChildren.add(child)
+
+  const session = {
+    key,
+    model,
+    child,
+    attachmentDir,
+    stdout: "",
+    stderr: "",
+    activeTurn: undefined,
+    queue: Promise.resolve(),
+    busy: 0,
+    idleTimer: undefined,
+    closed: false,
+  }
+
+  const removeSession = () => {
+    if (agySessions.get(key) === session) agySessions.delete(key)
+  }
+  const cleanupDirectory = () => { void rm(attachmentDir, { recursive: true, force: true }).catch(() => {}) }
+  const rejectActive = (error) => {
+    const turn = session.activeTurn
+    if (!turn) return
+    session.activeTurn = undefined
+    turn.signal?.removeEventListener("abort", turn.abort)
+    turn.reject(error)
+  }
+  const dispose = (error = new Error("AGY session closed")) => {
+    if (session.closed) return
+    session.closed = true
+    clearTimeout(session.idleTimer)
+    removeSession()
+    rejectActive(error)
+    if (child.exitCode === null && !child.killed) child.kill()
+    cleanupDirectory()
+  }
+  const scheduleIdleExpiry = () => {
+    clearTimeout(session.idleTimer)
+    if (session.closed || session.busy) return
+    session.idleTimer = setTimeout(() => {
+      if (!session.busy) dispose(new Error("AGY chat process expired after two hours idle; start a new chat turn"))
+    }, SESSION_IDLE_TIMEOUT_MS)
+    session.idleTimer.unref?.()
+  }
+
+  const handleLine = (line) => {
+    if (!line.trim()) return
+    let event
+    try { event = JSON.parse(line) } catch { return }
+    const turn = session.activeTurn
+    if (!turn) return
+    try { turn.onEvent(event) } catch (error) {
+      dispose(error instanceof Error ? error : new Error(String(error)))
+      return
     }
-    const abort = () => fail(signal.reason ?? new Error("Request aborted"))
-    signal?.addEventListener("abort", abort, { once: true })
-    const handleLine = (line) => {
-      if (!line.trim()) return
-      try {
-        const event = JSON.parse(line)
-        onEvent(event)
-        if (event.event === "result") result = event.result
-      } catch {
-        // Ignore non-JSON diagnostic lines; agy writes its machine stream as NDJSON.
-      }
+    if (event.event === "result") {
+      session.activeTurn = undefined
+      turn.signal?.removeEventListener("abort", turn.abort)
+      turn.resolve(event.result)
     }
-    child.stdout.setEncoding("utf8").on("data", (chunk) => {
-      stdout += chunk
-      let newline
-      while ((newline = stdout.indexOf("\n")) !== -1) {
-        handleLine(stdout.slice(0, newline).replace(/\r$/, ""))
-        stdout = stdout.slice(newline + 1)
-      }
-    })
-    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk })
-    child.stdin.on("error", fail)
-    child.stdin.end(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n")
-    child.once("error", fail)
-    child.once("close", (code) => {
-      cleanup()
-      if (settled) return
-      settled = true
-      handleLine(stdout)
-      if (code !== 0 || result?.status !== "SUCCESS") {
-        reject(new Error(result?.error || stderr.trim() || `agy exited with code ${code}`))
-        return
-      }
-      resolve(result)
-    })
+  }
+
+  child.stdout.setEncoding("utf8").on("data", (chunk) => {
+    session.stdout += chunk
+    let newline
+    while ((newline = session.stdout.indexOf("\n")) !== -1) {
+      handleLine(session.stdout.slice(0, newline).replace(/\r$/, ""))
+      session.stdout = session.stdout.slice(newline + 1)
+    }
   })
+  child.stderr.setEncoding("utf8").on("data", (chunk) => {
+    session.stderr = (session.stderr + chunk).slice(-16_384)
+  })
+  child.stdin.on("error", (error) => dispose(error))
+  child.once("error", (error) => dispose(error))
+  child.once("close", (code) => {
+    agyChildren.delete(child)
+    const error = new Error(session.stderr.trim() || `agy chat process exited with code ${code}`)
+    if (!session.closed) {
+      session.closed = true
+      clearTimeout(session.idleTimer)
+      removeSession()
+      rejectActive(error)
+      cleanupDirectory()
+    }
+  })
+
+  session.dispose = dispose
+  session.runTurn = (messages, onEvent = () => {}, signal) => {
+    session.busy++
+    clearTimeout(session.idleTimer)
+    const turn = session.queue.then(async () => {
+      if (session.closed) throw new Error("AGY chat process is no longer available; start a new chat turn")
+      if (signal?.aborted) throw signal.reason ?? new Error("Request aborted")
+      const turnAttachmentDir = await mkdtemp(join(attachmentDir, "turn-"))
+      try {
+        const prompt = await promptFrom(messages, turnAttachmentDir)
+        const result = await new Promise((resolve, reject) => {
+          if (session.closed) {
+            reject(new Error("AGY chat process is no longer available"))
+            return
+          }
+          const active = { resolve, reject, onEvent, signal }
+          active.abort = () => dispose(signal.reason ?? new Error("Request aborted"))
+          session.activeTurn = active
+          signal?.addEventListener("abort", active.abort, { once: true })
+          child.stdin.write(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n", (error) => {
+            if (error) dispose(error)
+          })
+        })
+        if (result?.status !== "SUCCESS") throw new Error(result?.error || `agy finished with status ${result?.status ?? "unknown"}`)
+        return result
+      } finally {
+        await rm(turnAttachmentDir, { recursive: true, force: true })
+      }
+    })
+    session.queue = turn.catch(() => {})
+    return turn.finally(() => {
+      session.busy--
+      if (!session.closed) scheduleIdleExpiry()
+    })
+  }
+  scheduleIdleExpiry()
+  return session
 }
+
+async function getAgySession(command, model, key) {
+  const existing = agySessions.get(key)
+  if (existing) {
+    const session = await existing
+    if (!session.closed) return session
+  }
+
+  const creating = mkdtemp(join(tmpdir(), "agy-session-attachments-")).then((attachmentDir) =>
+    createAgySession(command, model, key, attachmentDir),
+  )
+  agySessions.set(key, creating)
+  try {
+    const session = await creating
+    if (agySessions.get(key) === creating) agySessions.set(key, session)
+    return session
+  } catch (error) {
+    if (agySessions.get(key) === creating) agySessions.delete(key)
+    throw error
+  }
+}
+
+process.once("exit", () => {
+  for (const child of agyChildren) child.kill()
+})
 
 function sendJson(response, status, body) {
   response.writeHead(status, {
@@ -368,10 +485,9 @@ async function handle(request, response, command) {
   }
   if (finishPendingActivity(body, response, model, id, created, stream)) return
 
-  const attachmentDir = await mkdtemp(join(tmpdir(), "agy-openai-attachments-"))
   const sessionId = request.headers["x-opencode-session"]
-  const conversationKey = typeof sessionId === "string" ? `${sessionId}:${model}` : undefined
-  const conversationId = conversationKey ? conversations.get(conversationKey) : undefined
+  const persistent = typeof sessionId === "string" && sessionId.length > 0
+  const sessionKey = persistent ? `${sessionId}:${model}` : randomUUID()
   const controller = new AbortController()
   response.once("close", () => {
     if (!response.writableEnded) controller.abort()
@@ -379,6 +495,7 @@ async function handle(request, response, command) {
 
   let heartbeat
   let streamedAnswer = ""
+  let session
   const activityState = new Map()
   const openActivityKeys = new Set()
   if (stream) {
@@ -398,14 +515,8 @@ async function handle(request, response, command) {
   }
 
   try {
-    const messages = conversationId
-      ? body.messages.slice(Math.max(0, body.messages.map((message) => message.role).lastIndexOf("user")))
-      : body.messages
-    const prompt = await promptFrom(messages, attachmentDir)
-    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal, conversationId, (event) => {
-      if (event.event === "result" && event.result?.conversation_id && conversationKey) {
-        conversations.set(conversationKey, event.result.conversation_id)
-      }
+    session = await getAgySession(command, model, sessionKey)
+    const result = await session.runTurn(body.messages, (event) => {
       if (controller.signal.aborted || response.destroyed) return
       if (event.event === "step_update" && event.step_update?.step_type === "agent_response") {
         if (typeof event.step_update.text_delta === "string" && event.step_update.text_delta) {
@@ -441,9 +552,8 @@ async function handle(request, response, command) {
         }
         if (update) writeSse(response, id, model, created, { reasoning_content: update })
       }
-    })
+    }, controller.signal)
     if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
-    if (result.conversation_id && conversationKey) conversations.set(conversationKey, result.conversation_id)
     const text = result.response ?? streamedAnswer
     for (const key of openActivityKeys) {
       const activity = activityState.get(key)
@@ -488,7 +598,7 @@ async function handle(request, response, command) {
     }
   } finally {
     clearInterval(heartbeat)
-    await rm(attachmentDir, { recursive: true, force: true })
+    if (!persistent) session?.dispose(new Error("One-shot AGY request completed"))
   }
 }
 
