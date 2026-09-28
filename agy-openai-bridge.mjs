@@ -1,28 +1,91 @@
 import { randomUUID } from "node:crypto"
+import { mkdtemp, open, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { extname, join } from "node:path"
 import { spawn } from "node:child_process"
 import { createServer } from "node:http"
 
 const HOST = "127.0.0.1"
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
-const MAX_BODY_BYTES = 2 * 1024 * 1024
 const servers = new Map()
 
-function promptFrom(messages = []) {
-  return messages.map((message) => {
-    const content = typeof message.content === "string"
-      ? message.content
-      : Array.isArray(message.content)
-        ? message.content.map((part) => part.text ?? "").join("")
-        : ""
-    return `--- ${message.role ?? "user"} ---\n${content}`
-  }).join("\n\n")
+const MIME_EXTENSIONS = new Map([
+  ["image/png", ".png"], ["image/jpeg", ".jpg"], ["image/gif", ".gif"],
+  ["image/webp", ".webp"], ["image/bmp", ".bmp"], ["image/tiff", ".tiff"],
+  ["image/svg+xml", ".svg"], ["application/pdf", ".pdf"],
+  ["video/mp4", ".mp4"], ["video/quicktime", ".mov"], ["video/webm", ".webm"], ["video/x-msvideo", ".avi"],
+  ["audio/mpeg", ".mp3"], ["audio/wav", ".wav"], ["audio/mp4", ".m4a"],
+  ["application/msword", ".doc"], ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"],
+  ["application/vnd.oasis.opendocument.text", ".odt"], ["application/rtf", ".rtf"],
+  ["application/vnd.ms-powerpoint", ".ppt"], ["application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"],
+  ["application/vnd.ms-excel", ".xls"], ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"],
+  ["application/epub+zip", ".epub"],
+  ["text/plain", ".txt"], ["text/markdown", ".md"], ["text/csv", ".csv"],
+  ["text/html", ".html"], ["text/xml", ".xml"],
+  ["application/json", ".json"], ["application/xml", ".xml"],
+  ["application/zip", ".zip"], ["application/octet-stream", ".bin"],
+])
+
+function attachmentUrl(part) {
+  const value = part.image_url?.url ?? part.image_url ?? part.file?.url ?? part.file?.data ?? part.url ?? part.data
+  return typeof value === "string" ? value : undefined
 }
 
-function runAgy(command, model, prompt, signal) {
+async function saveAttachment(part, directory) {
+  const url = attachmentUrl(part)
+  if (!url?.startsWith("data:")) return undefined
+  const match = /^data:([^;,]+)?;base64,([\s\S]*)$/i.exec(url)
+  if (!match) throw new Error("Only base64 data-URI attachments can be forwarded to agy")
+  const mime = (match[1] || part.mimeType || part.mime_type || "application/octet-stream").toLowerCase()
+  const extension = MIME_EXTENSIONS.get(mime) ?? extname(part.filename ?? part.name ?? "")
+  const filePath = join(directory, `${randomUUID()}${extension || ".bin"}`)
+  const file = await open(filePath, "w")
+  try {
+    const encoded = match[2]
+    const chunkSize = 256 * 1024 // multiple of four so base64 groups are never split
+    for (let index = 0; index < encoded.length; index += chunkSize) {
+      const bytes = Buffer.from(encoded.slice(index, index + chunkSize), "base64")
+      let offset = 0
+      while (offset < bytes.length) {
+        const { bytesWritten } = await file.write(bytes, offset)
+        offset += bytesWritten
+      }
+    }
+  } finally {
+    await file.close()
+  }
+  return { mime, filePath }
+}
+
+async function promptFrom(messages = [], attachmentDir) {
+  const prompt = []
+  for (const message of messages) {
+    const sections = []
+    if (typeof message.content === "string") sections.push(message.content)
+    else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (typeof part.text === "string") sections.push(part.text)
+        else if (["image_url", "image", "input_image", "file", "input_file"].includes(part.type)) {
+          const attachment = await saveAttachment(part, attachmentDir)
+          if (attachment) sections.push(`Attached ${attachment.mime} file: @${attachment.filePath}`)
+          else {
+            const url = attachmentUrl(part)
+            if (url) sections.push(`Attached file URL: ${url}`)
+          }
+        }
+      }
+    }
+    prompt.push(`--- ${message.role ?? "user"} ---\n${sections.join("\n")}`)
+  }
+  return prompt.join("\n\n")
+}
+
+function runAgy(command, model, prompt, attachmentDir, signal) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, [
       "--model", model,
+      "--add-dir", attachmentDir,
       "--input-format", "stream-json",
       "--output-format", "stream-json",
       "--print-timeout", "30m",
@@ -106,13 +169,7 @@ async function handle(request, response, command) {
     return
   }
   let raw = ""
-  for await (const part of request) {
-    raw += part
-    if (Buffer.byteLength(raw) > MAX_BODY_BYTES) {
-      sendJson(response, 413, { error: { message: "Request body too large" } })
-      return
-    }
-  }
+  for await (const part of request) raw += part
   let body
   try { body = JSON.parse(raw) } catch {
     sendJson(response, 400, { error: { message: "Invalid JSON body" } })
@@ -124,14 +181,15 @@ async function handle(request, response, command) {
     sendJson(response, 400, { error: { message: "Invalid or missing model slug" } })
     return
   }
-  const prompt = promptFrom(body.messages)
+  const attachmentDir = await mkdtemp(join(tmpdir(), "agy-openai-attachments-"))
   const controller = new AbortController()
   response.once("close", () => {
     if (!response.writableEnded) controller.abort()
   })
 
   try {
-    const result = await runAgy(command, model, prompt, controller.signal)
+    const prompt = await promptFrom(body.messages, attachmentDir)
+    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal)
     const id = `chatcmpl-${result.conversation_id ?? randomUUID()}`
     const created = Math.floor(Date.now() / 1000)
     const text = result.response ?? ""
@@ -170,6 +228,8 @@ async function handle(request, response, command) {
     } else {
       sendJson(response, 502, { error: { message: error.message } })
     }
+  } finally {
+    await rm(attachmentDir, { recursive: true, force: true })
   }
 }
 
@@ -178,6 +238,7 @@ export function startBridge(command) {
   const server = createServer((request, response) => {
     void handle(request, response, command)
   })
+  server.requestTimeout = 0
   const ready = new Promise((resolve, reject) => {
     server.once("error", (error) => {
       if (error.code === "EADDRINUSE") {

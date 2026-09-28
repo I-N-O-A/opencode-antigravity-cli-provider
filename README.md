@@ -2,7 +2,7 @@
 
 > **LET YOUR LLM DO IT. LET YOUR AGENT DO IT.**
 >
-> **LOWEST-RISK APPROACH:** OpenCode calls the official `agy` CLI locally. No direct Antigravity API calls, custom OAuth, or project-stored credentials. Google receives a request made through `agy`, much like one you start yourself in a terminal. 
+> **LOWEST-RISK APPROACH:** OpenCode calls the official `agy` CLI locally. No direct Antigravity API calls, custom OAuth, or project-stored credentials. Google receives a request made through `agy`, much like one you start yourself in a terminal. Google may still identify the client; this is not a promise of invisibility or zero risk.
 
 ## Let your agent install it
 
@@ -11,13 +11,13 @@ Run from the root of the OpenCode project you want to update:
 **macOS / Linux**
 
 ```sh
-opencode run "$(curl -fsSL https://raw.githubusercontent.com/kamueone/opencode-antigravity-cli-provider/main/AGENT-PROMPT.md)"
+opencode run --agent build "$(curl -fsSL https://raw.githubusercontent.com/kamueone/opencode-antigravity-cli-provider/main/AGENT-PROMPT.md)"
 ```
 
 **Windows PowerShell**
 
 ```powershell
-opencode run (Invoke-RestMethod https://raw.githubusercontent.com/kamueone/opencode-antigravity-cli-provider/main/AGENT-PROMPT.md)
+opencode run --agent build (Invoke-RestMethod https://raw.githubusercontent.com/kamueone/opencode-antigravity-cli-provider/main/AGENT-PROMPT.md)
 ```
 
 The agent is instructed to inspect your OpenCode version, rebuild the integration for your project, preserve your existing default model, and test what it can. Review the changes it proposes before using them.
@@ -30,8 +30,8 @@ Restart OpenCode and select `agy-cli/<slug>`.
 
 ## What this does
 
-The local bridge passes the selected slug as `agy --model <slug>` and sends the prompt to the CLI over stdin. It listens only on `127.0.0.1`, rejects browser-origin requests and unverified port collisions, and limits request bodies to 2 MiB. It has no separate authentication, so do not expose or proxy its port. Local processes running as your user can still reach it.
+The local bridge passes the selected slug as `agy --model <slug>` and sends the prompt to the CLI over stdin. Image and file attachments are written to a temporary local folder and referenced in the prompt as `@file`; the CLI reads them through its normal workspace tools. Temporary files are deleted after the response. The bridge has no fixed request-size ceiling or upload timeout. Very large attachments still depend on OpenCode's request handling, available RAM/disk space, `agy`, and the selected model's context limits.
 
-Text input/output only. The adapter buffers the CLI response before sending it to OpenCode; it does not support tool calls, images, or token-by-token streaming.
+The bridge listens only on `127.0.0.1`, rejects browser-origin requests and unverified port collisions, and has no separate authentication. Do not expose or proxy its port; local processes running as your user can still reach it. OpenCode streaming is buffered until `agy` finishes; this is not token-by-token streaming. Model tool calls are not supported.
 
 See [AGENT-PROMPT.md](AGENT-PROMPT.md) for the full rebuild instructions and [TODO.md](TODO.md) for follow-up work.
