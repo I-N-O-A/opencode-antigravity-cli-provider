@@ -121,7 +121,7 @@ async function handle(request, response, command) {
 
   const model = String(body.model ?? "").replace(/^agy-cli\//, "")
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(model)) {
-    sendJson(response, 400, { error: { message: "Missing model slug" } })
+    sendJson(response, 400, { error: { message: "Invalid or missing model slug" } })
     return
   }
   const prompt = promptFrom(body.messages)
@@ -155,7 +155,6 @@ async function handle(request, response, command) {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
       connection: "keep-alive",
-      "access-control-allow-origin": "*",
     })
     response.write(`data: ${JSON.stringify(chunk(id, model, created, ""))}\n\n`)
     for (let offset = 0; offset < text.length; offset += 96) {
