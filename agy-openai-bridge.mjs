@@ -111,7 +111,7 @@ function runAgy(command, model, prompt, attachmentDir, signal, conversationId, o
       if (!line.trim()) return
       try {
         const event = JSON.parse(line)
-        onEvent(event, line)
+        onEvent(event)
         if (event.event === "result") result = event.result
       } catch {
         // Ignore non-JSON diagnostic lines; agy writes its machine stream as NDJSON.
@@ -163,6 +163,18 @@ function chunk(id, model, created, delta = {}, finishReason = null) {
 
 function writeSse(response, id, model, created, delta, finishReason = null) {
   response.write(`data: ${JSON.stringify(chunk(id, model, created, delta, finishReason))}\n\n`)
+}
+
+function formatAgyEvent(event) {
+  const step = event.step_update
+  let heading = `AGY event · ${event.event ?? "unknown"}`
+  if (event.event === "init") heading = `AGY session · ${event.init?.model ?? event.init?.model_id ?? "initialized"}`
+  if (event.event === "result") heading = `AGY result · ${event.result?.status ?? "complete"}`
+  if (event.event === "step_update" && step) {
+    const label = step.tool_name ?? step.step_type ?? "step"
+    heading = `AGY ${step.step_type ?? "step"} · ${label} · ${step.state ?? "update"}`
+  }
+  return `### ${heading}\n\n\`\`\`json\n${JSON.stringify(event, null, 2)}\n\`\`\`\n\n`
 }
 
 async function handle(request, response, command) {
@@ -237,7 +249,7 @@ async function handle(request, response, command) {
       ? body.messages.slice(Math.max(0, body.messages.map((message) => message.role).lastIndexOf("user")))
       : body.messages
     const prompt = await promptFrom(messages, attachmentDir)
-    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal, conversationId, (event, rawLine) => {
+    const result = await runAgy(command, model, prompt, attachmentDir, controller.signal, conversationId, (event) => {
       if (event.event === "result" && event.result?.conversation_id && conversationKey) {
         conversations.set(conversationKey, event.result.conversation_id)
       }
@@ -246,9 +258,9 @@ async function handle(request, response, command) {
         streamedText ||= Boolean(event.step_update.text_delta)
         if (event.step_update.text_delta) writeSse(response, id, model, created, { content: event.step_update.text_delta })
       }
-      // Preserve every exact CLI event line in OpenCode's reasoning stream. Never
-      // summarize, redact, filter, or truncate; answer deltas are also streamed as text.
-      writeSse(response, id, model, created, { reasoning_content: `${rawLine}\n` })
+      // Pretty-print the parsed NDJSON event for readability, preserving every field
+      // and value. Answer deltas are also streamed as text in OpenCode's answer part.
+      writeSse(response, id, model, created, { reasoning_content: formatAgyEvent(event) })
     })
     if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
     if (result.conversation_id && conversationKey) conversations.set(conversationKey, result.conversation_id)
