@@ -179,8 +179,36 @@ const FIELD_LABELS = new Map([
   ["OldContent", "Previous content"], ["output", "Output"], ["error", "Error"],
 ])
 
+const SUMMARY_PARAMETER_KEYS = new Map([
+  ["run_command", ["CommandLine", "command", "cmd"]],
+  ["view_file", ["AbsolutePath", "FilePath", "file_path", "path"]],
+  ["write_to_file", ["AbsolutePath", "FilePath", "file_path", "path"]],
+  ["replace_file_content", ["AbsolutePath", "FilePath", "file_path", "path"]],
+  ["multi_replace_file_content", ["AbsolutePath", "FilePath", "file_path", "path"]],
+  ["grep_search", ["Query", "query", "SearchQuery", "search_query", "pattern"]],
+  ["find_by_name", ["Pattern", "pattern", "Name", "name"]],
+  ["manage_task", ["Action", "action", "TaskId", "task_id"]],
+  ["ask_question", ["Question", "question"]],
+])
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char])
+}
+
+function formatStepSummary(stepNumber, tool, toolLabel, parameters) {
+  const fields = parameters && typeof parameters === "object" ? parameters : {}
+  const candidates = SUMMARY_PARAMETER_KEYS.get(tool) ?? Object.keys(fields).filter((key) => !/content|output|result/i.test(key))
+  const normalized = new Map(Object.entries(fields).map(([key, value]) => [key.toLowerCase(), value]))
+  const previews = []
+  for (const key of candidates) {
+    const value = normalized.get(key.toLowerCase())
+    if (value == null || (typeof value !== "string" && typeof value !== "number")) continue
+    const text = String(value).trim()
+    if (!text) continue
+    previews.push(`<span>${escapeHtml(FIELD_LABELS.get(key) ?? key.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase()))}: <code>${escapeHtml(text)}</code></span>`)
+    if (previews.length === 2) break
+  }
+  return `<summary>Step ${stepNumber} · ${escapeHtml(toolLabel)}${previews.length ? ` · ${previews.join(" · ")}` : ""}</summary>`
 }
 
 function formatActivityFields(value) {
@@ -227,7 +255,7 @@ function formatAgyEvent(event, activityState) {
     }
     activityState.openStep = stepNumber
     activityState.seenSteps.add(stepNumber)
-    return `<details>\n<summary>Step ${stepNumber} · ${escapeHtml(toolLabel)}</summary>\n<p><strong>Status:</strong> In progress</p>\n<div><strong>Action</strong>${formatActivityFields(parameters)}</div>\n`
+    return `<details>\n${formatStepSummary(stepNumber, tool, toolLabel, parameters)}\n<p><strong>Status:</strong> In progress</p>\n<div><strong>Action</strong>${formatActivityFields(parameters)}</div>\n`
   }
 
   if (activityState.completedSteps.has(stepNumber)) return ""
@@ -238,7 +266,7 @@ function formatAgyEvent(event, activityState) {
     if (activityState.openStep !== undefined) text += "</details>\n\n"
     activityState.openStep = stepNumber
     activityState.seenSteps.add(stepNumber)
-    text += `<details>\n<summary>Step ${stepNumber} · ${escapeHtml(toolLabel)}</summary>\n`
+    text += `<details>\n${formatStepSummary(stepNumber, tool, toolLabel, parameters)}\n`
   }
   text += `<p><strong>Status:</strong> ${status}</p>\n`
   if (output !== undefined) text += `<div><strong>Output</strong>${formatActivityFields(output)}</div>\n`
