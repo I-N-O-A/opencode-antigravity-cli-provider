@@ -13,8 +13,8 @@ Reference: https://github.com/kamueone/opencode-antigravity-cli-provider. Read i
 - Discover `agy` portably: official Windows install path when present, otherwise `PATH`; use `PATH` on macOS/Linux. Never hardcode a person's profile path.
 - Route requests through a local bridge bound only to `127.0.0.1`. Keep prompts off process command lines; send them over stdin. Support OpenCode image/file attachments by staging them as temporary local files and referencing them in the agy prompt; clean them up after the request.
 - Do not impose an arbitrary small request/attachment-size limit. Avoid unnecessary attachment copies and document practical RAM, disk, CLI, and model-context limits honestly.
-- Reject unexpected Host headers and browser Origin requests; set no permissive CORS headers. Limit request size. On port collision, continue only if a bridge health endpoint identifies the expected bridge; otherwise fail clearly.
-- Propagate request cancellation to the child CLI. Return readable CLI errors. Declare text-only/no-tools capabilities if that is all the implementation supports.
+- Reject unexpected Host headers and browser Origin requests; set no permissive CORS headers. Do not impose an arbitrary small request-size limit. On port collision, continue only if a bridge health endpoint identifies the expected bridge; otherwise fail clearly.
+- Propagate request cancellation to the child CLI. Return readable CLI errors. Declare only capabilities that are actually supported; model tool calls are not supported by the reference implementation.
 - Do not replace unrelated settings, permissions, plugins, or user files. Do not alter the user's default model.
 
 ## Work and verification
