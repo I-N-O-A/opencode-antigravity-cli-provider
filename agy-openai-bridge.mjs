@@ -165,16 +165,118 @@ function writeSse(response, id, model, created, delta, finishReason = null) {
   response.write(`data: ${JSON.stringify(chunk(id, model, created, delta, finishReason))}\n\n`)
 }
 
-function formatAgyEvent(event) {
-  const step = event.step_update
-  let heading = `AGY event · ${event.event ?? "unknown"}`
-  if (event.event === "init") heading = `AGY session · ${event.init?.model ?? event.init?.model_id ?? "initialized"}`
-  if (event.event === "result") heading = `AGY result · ${event.result?.status ?? "complete"}`
-  if (event.event === "step_update" && step) {
-    const label = step.tool_name ?? step.step_type ?? "step"
-    heading = `AGY ${step.step_type ?? "step"} · ${label} · ${step.state ?? "update"}`
+const TOOL_LABELS = new Map([
+  ["run_command", "Run command"], ["view_file", "Read file"], ["write_to_file", "Write file"],
+  ["replace_file_content", "Edit file"], ["multi_replace_file_content", "Edit files"],
+  ["grep_search", "Search project"], ["find_by_name", "Find file"],
+  ["manage_task", "Manage task"], ["ask_question", "Ask a question"],
+])
+
+const FIELD_LABELS = new Map([
+  ["AbsolutePath", "File path"], ["FilePath", "File path"], ["file_path", "File path"], ["Path", "Path"],
+  ["CommandLine", "Command"], ["Action", "Action"], ["TaskId", "Task ID"],
+  ["Content", "Content"], ["content", "Content"], ["NewContent", "New content"],
+  ["OldContent", "Previous content"], ["output", "Output"], ["error", "Error"],
+])
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char])
+}
+
+function formatActivityFields(value) {
+  if (value == null) return ""
+  if (typeof value !== "object") return `<pre><code>${escapeHtml(value)}</code></pre>`
+  const entries = Array.isArray(value) ? value.map((item, index) => [String(index + 1), item]) : Object.entries(value)
+  return entries.map(([key, item]) => {
+    const label = FIELD_LABELS.get(key) ?? key.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase())
+    return `<div><strong>${escapeHtml(label)}</strong>${formatActivityFields(item)}</div>`
+  }).join("")
+}
+
+function formatAgyEvent(event, activityState) {
+  if (event.event === "init") return `<p><strong>AGY CLI started</strong> · ${escapeHtml(event.init?.model ?? "Unknown model")}</p>\n\n`
+  if (event.event === "result") {
+    if (activityState.openStep !== undefined) {
+      activityState.openStep = undefined
+      if (event.result?.status === "SUCCESS") return "</details>\n\n"
+      const error = event.result?.error
+      return `</details>\n<p><strong>AGY request failed</strong>${error ? ` · ${escapeHtml(error)}` : ""}</p>\n\n`
+    }
+    if (event.result?.status === "SUCCESS") return ""
+    const error = event.result?.error
+    return `<p><strong>AGY error</strong>${error ? ` · ${escapeHtml(error)}` : ""}</p>\n\n`
   }
-  return `### ${heading}\n\n\`\`\`json\n${JSON.stringify(event, null, 2)}\n\`\`\`\n\n`
+  const step = event.step_update
+  if (event.event !== "step_update" || !step || step.step_type !== "tool") return ""
+
+  const tool = step.tool_name ?? step.tool_info?.name ?? "Tool"
+  const toolLabel = TOOL_LABELS.get(tool) ?? tool.replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase())
+  const index = Number(step.step_index)
+  const stepNumber = Number.isFinite(index) ? index : "?"
+  const info = step.tool_info ?? {}
+  const parameters = info.parameters ?? {}
+  const output = info.output
+  const error = info.error
+  if (step.state === "ACTIVE") {
+    if (activityState.seenSteps.has(stepNumber)) return ""
+    if (activityState.openStep !== undefined) {
+      const previous = `</details>\n\n`
+      activityState.openStep = undefined
+      const next = formatAgyEvent(event, activityState)
+      return previous + next
+    }
+    activityState.openStep = stepNumber
+    activityState.seenSteps.add(stepNumber)
+    return `<details>\n<summary>Step ${stepNumber} · ${escapeHtml(toolLabel)}</summary>\n<p><strong>Status:</strong> In progress</p>\n<div><strong>Action</strong>${formatActivityFields(parameters)}</div>\n`
+  }
+
+  if (activityState.completedSteps.has(stepNumber)) return ""
+  const failed = step.state === "ERROR" || error !== undefined
+  const status = failed ? "Failed" : step.state === "DONE" ? "Completed" : "Updated"
+  let text = ""
+  if (activityState.openStep !== stepNumber) {
+    if (activityState.openStep !== undefined) text += "</details>\n\n"
+    activityState.openStep = stepNumber
+    activityState.seenSteps.add(stepNumber)
+    text += `<details>\n<summary>Step ${stepNumber} · ${escapeHtml(toolLabel)}</summary>\n`
+  }
+  text += `<p><strong>Status:</strong> ${status}</p>\n`
+  if (output !== undefined) text += `<div><strong>Output</strong>${formatActivityFields(output)}</div>\n`
+  if (error !== undefined) text += `<div><strong>Error</strong>${formatActivityFields(error)}</div>\n`
+  activityState.openStep = undefined
+  activityState.completedSteps.add(stepNumber)
+  return `${text}</details>\n\n`
+}
+
+function inlineValue(value) {
+  if (typeof value !== "string") return `\`${String(value)}\``
+  const fence = "`".repeat(Math.max(1, ...[...value.matchAll(/`+/g)].map((match) => match[0].length + 1)))
+  return `${fence}${value}${fence}`
+}
+
+function formatAgyField(key, value, depth) {
+  const indent = "  ".repeat(depth)
+  const label = FIELD_LABELS.get(key) ?? key.replace(/_/g, " ")
+  if (value && typeof value === "object") return `${indent}- **${label}:**\n${formatAgyFields(value, depth + 1)}`
+  if (typeof value === "string" && value.includes("\n")) {
+    const fence = "`".repeat(Math.max(3, ...[...value.matchAll(/`+/g)].map((match) => match[0].length + 1)))
+    const content = value.split("\n").map((line) => `${indent}  ${line}`).join("\n")
+    return `${indent}- **${label}:**\n${indent}  ${fence}text\n${content}\n${indent}  ${fence}`
+  }
+  return `${indent}- **${label}:** ${inlineValue(value)}`
+}
+
+function formatAgyFields(value, depth = 0) {
+  const indent = "  ".repeat(depth)
+  if (Array.isArray(value)) {
+    return value.map((item) => item && typeof item === "object"
+      ? `${indent}-\n${formatAgyFields(item, depth + 1)}`
+      : `${indent}- ${inlineValue(item)}`).join("\n")
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).map(([key, item]) => formatAgyField(key, item, depth)).join("\n")
+  }
+  return `${indent}${inlineValue(value)}`
 }
 
 async function handle(request, response, command) {
@@ -228,6 +330,7 @@ async function handle(request, response, command) {
   const created = Math.floor(Date.now() / 1000)
   let heartbeat
   let streamedText = false
+  const activityState = { openStep: undefined, seenSteps: new Set(), completedSteps: new Set() }
   if (stream) {
     response.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
@@ -254,13 +357,19 @@ async function handle(request, response, command) {
         conversations.set(conversationKey, event.result.conversation_id)
       }
       if (!stream || controller.signal.aborted || response.destroyed) return
-      if (event.event === "step_update" && event.step_update?.step_type === "agent_response" && typeof event.step_update.text_delta === "string") {
-        streamedText ||= Boolean(event.step_update.text_delta)
-        if (event.step_update.text_delta) writeSse(response, id, model, created, { content: event.step_update.text_delta })
+      if (event.event === "step_update" && event.step_update?.step_type === "agent_response") {
+        if (typeof event.step_update.text_delta === "string" && event.step_update.text_delta) {
+          streamedText = true
+          writeSse(response, id, model, created, { content: event.step_update.text_delta })
+        }
+        // The answer delta is already visible live in the answer part. Repeating
+        // every token event in the single Thought block would add noise, not detail.
+        return
       }
-      // Pretty-print the parsed NDJSON event for readability, preserving every field
-      // and value. Answer deltas are also streamed as text in OpenCode's answer part.
-      writeSse(response, id, model, created, { reasoning_content: formatAgyEvent(event) })
+      // Render each AGY tool step as its own safe HTML disclosure inside the Thought.
+      // Omit session/protocol/token metadata; escape all AGY-supplied values.
+      const activity = formatAgyEvent(event, activityState)
+      if (activity) writeSse(response, id, model, created, { reasoning_content: activity })
     })
     if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
     if (result.conversation_id && conversationKey) conversations.set(conversationKey, result.conversation_id)
