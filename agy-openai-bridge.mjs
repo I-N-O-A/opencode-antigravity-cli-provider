@@ -10,6 +10,7 @@ const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
 const conversations = new Map()
+const pendingActivities = new Map()
 
 const MIME_EXTENSIONS = new Map([
   ["image/png", ".png"], ["image/jpeg", ".jpg"], ["image/gif", ".gif"],
@@ -165,146 +166,160 @@ function writeSse(response, id, model, created, delta, finishReason = null) {
   response.write(`data: ${JSON.stringify(chunk(id, model, created, delta, finishReason))}\n\n`)
 }
 
-const TOOL_LABELS = new Map([
+const ACTIVITY_TOOL_NAMES = new Map([
+  ["run_command", "agy_shell"], ["view_file", "agy_read"], ["write_to_file", "agy_write"],
+  ["replace_file_content", "agy_edit"], ["multi_replace_file_content", "agy_edit"],
+  ["grep_search", "agy_grep"], ["find_by_name", "agy_find"], ["manage_task", "agy_task"],
+  ["ask_question", "agy_question"], ["web_search", "agy_web_search"],
+  ["parallel_web_search", "agy_web_search"], ["web_fetch", "agy_web_fetch"],
+])
+
+function activityToolName(tool) {
+  return ACTIVITY_TOOL_NAMES.get(tool) ?? "agy_activity"
+}
+
+const ACTIVITY_LABELS = new Map([
   ["run_command", "Run command"], ["view_file", "Read file"], ["write_to_file", "Write file"],
   ["replace_file_content", "Edit file"], ["multi_replace_file_content", "Edit files"],
-  ["grep_search", "Search project"], ["find_by_name", "Find file"],
-  ["manage_task", "Manage task"], ["ask_question", "Ask a question"],
-])
-
-const FIELD_LABELS = new Map([
-  ["AbsolutePath", "File path"], ["FilePath", "File path"], ["file_path", "File path"], ["Path", "Path"],
-  ["CommandLine", "Command"], ["Action", "Action"], ["TaskId", "Task ID"],
-  ["Content", "Content"], ["content", "Content"], ["NewContent", "New content"],
-  ["OldContent", "Previous content"], ["output", "Output"], ["error", "Error"],
-])
-
-const SUMMARY_PARAMETER_KEYS = new Map([
-  ["run_command", ["CommandLine", "command", "cmd"]],
-  ["view_file", ["AbsolutePath", "FilePath", "file_path", "path"]],
-  ["write_to_file", ["AbsolutePath", "FilePath", "file_path", "path"]],
-  ["replace_file_content", ["AbsolutePath", "FilePath", "file_path", "path"]],
-  ["multi_replace_file_content", ["AbsolutePath", "FilePath", "file_path", "path"]],
-  ["grep_search", ["Query", "query", "SearchQuery", "search_query", "pattern"]],
-  ["find_by_name", ["Pattern", "pattern", "Name", "name"]],
-  ["manage_task", ["Action", "action", "TaskId", "task_id"]],
-  ["ask_question", ["Question", "question"]],
+  ["grep_search", "Search files"], ["find_by_name", "Find files"], ["manage_task", "Manage task"],
+  ["ask_question", "Ask question"], ["web_search", "Web search"],
+  ["parallel_web_search", "Web search"], ["web_fetch", "Fetch webpage"],
 ])
 
 function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char])
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[char])
 }
 
-function formatStepSummary(stepNumber, tool, toolLabel, parameters) {
-  const fields = parameters && typeof parameters === "object" ? parameters : {}
-  const candidates = SUMMARY_PARAMETER_KEYS.get(tool) ?? Object.keys(fields).filter((key) => !/content|output|result/i.test(key))
-  const normalized = new Map(Object.entries(fields).map(([key, value]) => [key.toLowerCase(), value]))
-  const previews = []
-  for (const key of candidates) {
-    const value = normalized.get(key.toLowerCase())
-    if (value == null || (typeof value !== "string" && typeof value !== "number")) continue
-    const text = String(value).trim()
-    if (!text) continue
-    previews.push(`<span>${escapeHtml(FIELD_LABELS.get(key) ?? key.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase()))}: <code>${escapeHtml(text)}</code></span>`)
-    if (previews.length === 2) break
+function displayValue(value) {
+  if (typeof value === "string") return value
+  try { return JSON.stringify(value, null, 2) } catch { return String(value) }
+}
+
+function liveActivityStart(activity) {
+  const parameters = activity.parameters && typeof activity.parameters === "object" ? activity.parameters : {}
+  const priority = ["CommandLine", "TargetFile", "AbsolutePath", "Query", "Url", "URL", "path", "file_path"]
+  const key = priority.find((name) => parameters[name] !== undefined) ?? Object.keys(parameters)[0]
+  const label = ACTIVITY_LABELS.get(activity.tool) ?? activity.tool.replace(/_/g, " ")
+  const summary = key
+    ? `${label} · ${key}: ${displayValue(parameters[key])}`
+    : label
+  const action = escapeHtml(displayValue(parameters))
+  return `<details><summary>${escapeHtml(summary)}</summary><p><strong>Status:</strong> In progress</p><p><strong>Action</strong></p><pre><code>${action}</code></pre>`
+}
+
+function liveActivityFinish(activity) {
+  const output = activity.output === undefined ? "" : `<p><strong>Output</strong></p><pre><code>${escapeHtml(displayValue(activity.output))}</code></pre>`
+  const error = activity.error === undefined ? "" : `<p><strong>Error</strong></p><pre><code>${escapeHtml(displayValue(activity.error))}</code></pre>`
+  return `<p><strong>Status:</strong> ${escapeHtml(activity.status)}</p>${output}${error}</details>\n\n`
+}
+
+function activityToolCalls(activities, advertisedTools) {
+  if (!activities.length) return undefined
+  const available = new Set((advertisedTools ?? []).map((tool) => tool.function?.name ?? tool.name))
+  if (!available.size) return undefined
+  const visibleActivities = activities.filter((activity) => available.has(activityToolName(activity.tool)))
+  if (!visibleActivities.length) return undefined
+  const group = randomUUID()
+  const toolCalls = visibleActivities.map((activity, index) => ({
+    id: `agy-${group}-${index}`,
+    type: "function",
+    function: {
+      name: activityToolName(activity.tool),
+      arguments: JSON.stringify({
+        tool: activity.tool,
+        status: activity.status,
+        parameters: activity.parameters,
+        ...(activity.output !== undefined ? { output: activity.output } : {}),
+        ...(activity.error !== undefined ? { error: activity.error } : {}),
+      }),
+    },
+  }))
+  return { group, toolCalls }
+}
+
+function activityGroupFromMessages(messages = []) {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message.role !== "tool" || typeof message.tool_call_id !== "string") continue
+    const match = /^agy-([0-9a-f-]+)-\d+$/i.exec(message.tool_call_id)
+    if (match) return match[1]
   }
-  return `<summary>Step ${stepNumber} · ${escapeHtml(toolLabel)}${previews.length ? ` · ${previews.join(" · ")}` : ""}</summary>`
 }
 
-function formatActivityFields(value) {
-  if (value == null) return ""
-  if (typeof value !== "object") return `<pre><code>${escapeHtml(value)}</code></pre>`
-  const entries = Array.isArray(value) ? value.map((item, index) => [String(index + 1), item]) : Object.entries(value)
-  return entries.map(([key, item]) => {
-    const label = FIELD_LABELS.get(key) ?? key.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase())
-    return `<div><strong>${escapeHtml(label)}</strong>${formatActivityFields(item)}</div>`
-  }).join("")
+function finishPendingActivity(body, response, model, id, created, stream) {
+  const group = activityGroupFromMessages(body.messages)
+  const pending = group && pendingActivities.get(group)
+  if (!pending) return false
+  const received = new Set((body.messages ?? [])
+    .filter((message) => message.role === "tool" && typeof message.tool_call_id === "string")
+    .map((message) => message.tool_call_id))
+  if (!pending.toolCallIds.every((toolCallId) => received.has(toolCallId))) {
+    sendJson(response, 409, { error: { message: "AGY activity display tools have not all completed" } })
+    return true
+  }
+  pendingActivities.delete(group)
+  if (stream) {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+    })
+    response.flushHeaders()
+    writeSse(response, id, model, created, { role: "assistant" })
+    if (pending.text) writeSse(response, id, model, created, { content: pending.text })
+    writeSse(response, id, model, created, {}, "stop")
+    response.end("data: [DONE]\n\n")
+  } else {
+    sendJson(response, 200, {
+      id,
+      object: "chat.completion",
+      created,
+      model,
+      choices: [{ index: 0, message: { role: "assistant", content: pending.text }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    })
+  }
+  return true
 }
 
-function formatAgyEvent(event, activityState) {
-  if (event.event === "init") return `<p><strong>AGY CLI started</strong> · ${escapeHtml(event.init?.model ?? "Unknown model")}</p>\n\n`
-  if (event.event === "result") {
-    if (activityState.openStep !== undefined) {
-      activityState.openStep = undefined
-      if (event.result?.status === "SUCCESS") return "</details>\n\n"
-      const error = event.result?.error
-      return `</details>\n<p><strong>AGY request failed</strong>${error ? ` · ${escapeHtml(error)}` : ""}</p>\n\n`
+function sendActivityToolCalls(response, stream, model, id, created, result, toolCallData) {
+  const { group, toolCalls } = toolCallData
+  pendingActivities.set(group, {
+    text: result.response ?? "",
+    toolCallIds: toolCalls.map((toolCall) => toolCall.id),
+    createdAt: Date.now(),
+  })
+  if (stream) {
+    if (!response.headersSent) {
+      response.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+      })
+      response.flushHeaders()
+      writeSse(response, id, model, created, { role: "assistant" })
     }
-    if (event.result?.status === "SUCCESS") return ""
-    const error = event.result?.error
-    return `<p><strong>AGY error</strong>${error ? ` · ${escapeHtml(error)}` : ""}</p>\n\n`
+    toolCalls.forEach((toolCall, index) => writeSse(response, id, model, created, {
+      tool_calls: [{ index, ...toolCall }],
+    }))
+    writeSse(response, id, model, created, {}, "tool_calls")
+    response.end("data: [DONE]\n\n")
+    return
   }
-  const step = event.step_update
-  if (event.event !== "step_update" || !step || step.step_type !== "tool") return ""
-
-  const tool = step.tool_name ?? step.tool_info?.name ?? "Tool"
-  const toolLabel = TOOL_LABELS.get(tool) ?? tool.replace(/_/g, " ").replace(/^./, (letter) => letter.toUpperCase())
-  const index = Number(step.step_index)
-  const stepNumber = Number.isFinite(index) ? index : "?"
-  const info = step.tool_info ?? {}
-  const parameters = info.parameters ?? {}
-  const output = info.output
-  const error = info.error
-  if (step.state === "ACTIVE") {
-    if (activityState.seenSteps.has(stepNumber)) return ""
-    if (activityState.openStep !== undefined) {
-      const previous = `</details>\n\n`
-      activityState.openStep = undefined
-      const next = formatAgyEvent(event, activityState)
-      return previous + next
-    }
-    activityState.openStep = stepNumber
-    activityState.seenSteps.add(stepNumber)
-    return `<details>\n${formatStepSummary(stepNumber, tool, toolLabel, parameters)}\n<p><strong>Status:</strong> In progress</p>\n<div><strong>Action</strong>${formatActivityFields(parameters)}</div>\n`
-  }
-
-  if (activityState.completedSteps.has(stepNumber)) return ""
-  const failed = step.state === "ERROR" || error !== undefined
-  const status = failed ? "Failed" : step.state === "DONE" ? "Completed" : "Updated"
-  let text = ""
-  if (activityState.openStep !== stepNumber) {
-    if (activityState.openStep !== undefined) text += "</details>\n\n"
-    activityState.openStep = stepNumber
-    activityState.seenSteps.add(stepNumber)
-    text += `<details>\n${formatStepSummary(stepNumber, tool, toolLabel, parameters)}\n`
-  }
-  text += `<p><strong>Status:</strong> ${status}</p>\n`
-  if (output !== undefined) text += `<div><strong>Output</strong>${formatActivityFields(output)}</div>\n`
-  if (error !== undefined) text += `<div><strong>Error</strong>${formatActivityFields(error)}</div>\n`
-  activityState.openStep = undefined
-  activityState.completedSteps.add(stepNumber)
-  return `${text}</details>\n\n`
-}
-
-function inlineValue(value) {
-  if (typeof value !== "string") return `\`${String(value)}\``
-  const fence = "`".repeat(Math.max(1, ...[...value.matchAll(/`+/g)].map((match) => match[0].length + 1)))
-  return `${fence}${value}${fence}`
-}
-
-function formatAgyField(key, value, depth) {
-  const indent = "  ".repeat(depth)
-  const label = FIELD_LABELS.get(key) ?? key.replace(/_/g, " ")
-  if (value && typeof value === "object") return `${indent}- **${label}:**\n${formatAgyFields(value, depth + 1)}`
-  if (typeof value === "string" && value.includes("\n")) {
-    const fence = "`".repeat(Math.max(3, ...[...value.matchAll(/`+/g)].map((match) => match[0].length + 1)))
-    const content = value.split("\n").map((line) => `${indent}  ${line}`).join("\n")
-    return `${indent}- **${label}:**\n${indent}  ${fence}text\n${content}\n${indent}  ${fence}`
-  }
-  return `${indent}- **${label}:** ${inlineValue(value)}`
-}
-
-function formatAgyFields(value, depth = 0) {
-  const indent = "  ".repeat(depth)
-  if (Array.isArray(value)) {
-    return value.map((item) => item && typeof item === "object"
-      ? `${indent}-\n${formatAgyFields(item, depth + 1)}`
-      : `${indent}- ${inlineValue(item)}`).join("\n")
-  }
-  if (value && typeof value === "object") {
-    return Object.entries(value).map(([key, item]) => formatAgyField(key, item, depth)).join("\n")
-  }
-  return `${indent}${inlineValue(value)}`
+  sendJson(response, 200, {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: toolCalls }, finish_reason: "tool_calls" }],
+    usage: {
+      prompt_tokens: result.usage?.input_tokens ?? 0,
+      completion_tokens: result.usage?.output_tokens ?? 0,
+      total_tokens: result.usage?.total_tokens ?? 0,
+    },
+  })
 }
 
 async function handle(request, response, command) {
@@ -344,6 +359,15 @@ async function handle(request, response, command) {
     sendJson(response, 400, { error: { message: "Invalid or missing model slug" } })
     return
   }
+  const stream = Boolean(body.stream)
+  const id = `chatcmpl-${randomUUID()}`
+  const created = Math.floor(Date.now() / 1000)
+  const now = Date.now()
+  for (const [key, pending] of pendingActivities) {
+    if (now - pending.createdAt > 30 * 60 * 1000) pendingActivities.delete(key)
+  }
+  if (finishPendingActivity(body, response, model, id, created, stream)) return
+
   const attachmentDir = await mkdtemp(join(tmpdir(), "agy-openai-attachments-"))
   const sessionId = request.headers["x-opencode-session"]
   const conversationKey = typeof sessionId === "string" ? `${sessionId}:${model}` : undefined
@@ -353,12 +377,10 @@ async function handle(request, response, command) {
     if (!response.writableEnded) controller.abort()
   })
 
-  const stream = Boolean(body.stream)
-  const id = `chatcmpl-${randomUUID()}`
-  const created = Math.floor(Date.now() / 1000)
   let heartbeat
-  let streamedText = false
-  const activityState = { openStep: undefined, seenSteps: new Set(), completedSteps: new Set() }
+  let streamedAnswer = ""
+  const activityState = new Map()
+  const openActivityKeys = new Set()
   if (stream) {
     response.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
@@ -384,24 +406,58 @@ async function handle(request, response, command) {
       if (event.event === "result" && event.result?.conversation_id && conversationKey) {
         conversations.set(conversationKey, event.result.conversation_id)
       }
-      if (!stream || controller.signal.aborted || response.destroyed) return
+      if (controller.signal.aborted || response.destroyed) return
       if (event.event === "step_update" && event.step_update?.step_type === "agent_response") {
         if (typeof event.step_update.text_delta === "string" && event.step_update.text_delta) {
-          streamedText = true
-          writeSse(response, id, model, created, { content: event.step_update.text_delta })
+          streamedAnswer += event.step_update.text_delta
         }
-        // The answer delta is already visible live in the answer part. Repeating
-        // every token event in the single Thought block would add noise, not detail.
         return
       }
-      // Render each AGY tool step as its own safe HTML disclosure inside the Thought.
-      // Omit session/protocol/token metadata; escape all AGY-supplied values.
-      const activity = formatAgyEvent(event, activityState)
-      if (activity) writeSse(response, id, model, created, { reasoning_content: activity })
+      if (event.event !== "step_update" || event.step_update?.step_type !== "tool") return
+      const step = event.step_update
+      const tool = step.tool_name ?? step.tool_info?.name ?? "Tool"
+      const index = Number(step.step_index)
+      const fallbackKey = `${tool}:${JSON.stringify(step.tool_info?.parameters ?? {})}`
+      const key = Number.isFinite(index) ? String(index) : fallbackKey
+      const info = step.tool_info ?? {}
+      const failed = step.state === "ERROR" || info.error !== undefined
+      const activity = {
+        tool,
+        status: failed ? "Failed" : step.state === "ACTIVE" ? "In progress" : step.state === "DONE" ? "Completed" : "Updated",
+        parameters: info.parameters ?? activityState.get(key)?.parameters ?? {},
+        ...(info.output !== undefined ? { output: info.output } : {}),
+        ...(info.error !== undefined ? { error: info.error } : {}),
+      }
+      activityState.set(key, activity)
+      if (stream) {
+        let update = ""
+        if (!openActivityKeys.has(key)) {
+          update += liveActivityStart(activity)
+          openActivityKeys.add(key)
+        }
+        if (step.state === "DONE" || failed) {
+          update += liveActivityFinish(activity)
+          openActivityKeys.delete(key)
+        }
+        if (update) writeSse(response, id, model, created, { reasoning_content: update })
+      }
     })
     if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
     if (result.conversation_id && conversationKey) conversations.set(conversationKey, result.conversation_id)
-    const text = result.response ?? ""
+    const text = result.response ?? streamedAnswer
+    for (const key of openActivityKeys) {
+      const activity = activityState.get(key)
+      if (activity) writeSse(response, id, model, created, {
+        reasoning_content: liveActivityFinish({ ...activity, status: "Completed" }),
+      })
+    }
+    openActivityKeys.clear()
+    const toolCallData = activityToolCalls([...activityState.values()], body.tools)
+    if (toolCallData) {
+      clearInterval(heartbeat)
+      sendActivityToolCalls(response, stream, model, id, created, { ...result, response: text }, toolCallData)
+      return
+    }
     if (!stream) {
       sendJson(response, 200, {
         id,
@@ -418,7 +474,7 @@ async function handle(request, response, command) {
       return
     }
 
-    if (!streamedText && text) writeSse(response, id, model, created, { content: text })
+    if (text) writeSse(response, id, model, created, { content: text })
     clearInterval(heartbeat)
     writeSse(response, id, model, created, {}, "stop")
     response.end("data: [DONE]\n\n")
