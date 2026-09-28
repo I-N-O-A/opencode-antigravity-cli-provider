@@ -1,39 +1,37 @@
-# Antigravity CLI provider for OpenCode
+# Antigravity CLI for OpenCode
 
-Use models exposed by the official `agy` CLI in OpenCode. Model listing and every completion are performed by `agy`; this project does not call Antigravity APIs or implement OAuth.
+> **LET YOUR LLM DO IT. LET YOUR AGENT DO IT.**
+>
+> **LOWEST-RISK APPROACH:** OpenCode calls the official `agy` CLI locally. No direct Antigravity API calls, custom OAuth, or project-stored credentials. Google receives a request made through `agy`, much like one you start yourself in a terminal. Google may still identify the client; this is not a promise of invisibility or zero risk.
 
-## Requirements
+## Let your agent install it
 
-- OpenCode 2.x with local project plugins enabled
-- Node.js runtime provided by OpenCode
-- Official Antigravity CLI (`agy`) installed and authenticated
-- `agy models` succeeds in a terminal
+Run from the root of the OpenCode project you want to update:
 
-## Install
+**macOS / Linux**
 
-1. Copy `agy-model-provider.ts` to `.opencode/plugins/agy-model-provider.ts` in your OpenCode project.
-2. Copy `agy-openai-bridge.mjs` to `.opencode/runtime/agy-openai-bridge.mjs`.
-3. Merge `opencode.provider.example.jsonc` into your `opencode.json`. Preserve your existing settings and default model.
-4. Restart OpenCode. The plugin discovers the executable from `%LOCALAPPDATA%\agy\bin\agy.exe` on Windows, then falls back to `agy` on `PATH`. macOS/Linux use `agy` on `PATH`.
-5. Select a configured `agy-cli/<slug>` model. Verify the available IDs using `agy models`.
+```sh
+opencode run "$(curl -fsSL https://raw.githubusercontent.com/kamueone/opencode-antigravity-cli-provider/main/AGENT-PROMPT.md)"
+```
 
-If you set `AGY_BRIDGE_PORT`, set the same port in the OpenAI-compatible provider's `baseURL`; the default is `47381`.
+**Windows PowerShell**
 
-The example keeps `google/gemini-3.8-flash` as the default and shows one model entry. Add one OpenCode model entry for each desired ID from `agy models`; OpenCode's provider model list is configured statically, while the plugin checks the CLI inventory at startup.
+```powershell
+opencode run (Invoke-RestMethod https://raw.githubusercontent.com/kamueone/opencode-antigravity-cli-provider/main/AGENT-PROMPT.md)
+```
 
-## Security and data flow
+The agent is instructed to inspect your OpenCode version, rebuild the integration for your project, preserve your existing default model, and test what it can. Review the changes it proposes before using them.
 
-OpenCode sends chat data to the local bridge on `127.0.0.1:47381`; the bridge starts the official CLI and passes the model ID as `agy --model <slug>`. The prompt goes to the CLI over stdin, not in the process argument list. The CLI owns authentication and network communication.
+## Do it manually
 
-The bridge accepts only loopback requests with the expected Host header, rejects browser-origin requests, has a 2 MiB request limit, and refuses to treat an unrelated process on its port as a healthy bridge. It has no standalone authentication; keep it bound to loopback and do not expose or proxy the port. Local processes running as the same user can access loopback services.
+Install and sign in to the official Antigravity CLI, then confirm `agy models` works. Copy `agy-model-provider.ts` to `.opencode/plugins/agy-model-provider.ts` and `agy-openai-bridge.mjs` to `.opencode/runtime/agy-openai-bridge.mjs`. Merge `opencode.provider.example.jsonc` into `opencode.json`, adding one model entry for each slug you want from `agy models`. Keep your current default; the example uses `google/gemini-3.8-flash`.
 
-This integration currently supports text input/output only. It buffers the CLI response before emitting OpenCode-compatible SSE chunks; it does not provide token-by-token generation or model tool calls.
+Restart OpenCode and select `agy-cli/<slug>`.
 
-## Troubleshooting
+## What this does
 
-- **No `agy-cli` models:** run `agy models` and confirm the CLI is on `PATH` (or in the official Windows install location); restart OpenCode.
-- **Port 47381 occupied:** stop the other service, then restart OpenCode. The plugin intentionally refuses an unverified listener.
-- **CLI/auth/model errors:** run `agy models` and a standalone `agy --model <slug> --print "Reply OK"` check.
-- **No tool use or images:** these are unsupported by this text-only adapter.
+The local bridge passes the selected slug as `agy --model <slug>` and sends the prompt to the CLI over stdin. It listens only on `127.0.0.1`, rejects browser-origin requests and unverified port collisions, and limits request bodies to 2 MiB. It has no separate authentication, so do not expose or proxy its port. Local processes running as your user can still reach it.
 
-See [`AGENT-PROMPT.md`](AGENT-PROMPT.md) for a ready-to-run implementation prompt and [`TODO.md`](TODO.md) for follow-up work.
+Text input/output only. The adapter buffers the CLI response before sending it to OpenCode; it does not support tool calls, images, or token-by-token streaming.
+
+See [AGENT-PROMPT.md](AGENT-PROMPT.md) for the full rebuild instructions and [TODO.md](TODO.md) for follow-up work.
