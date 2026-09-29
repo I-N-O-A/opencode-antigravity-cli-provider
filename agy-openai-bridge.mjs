@@ -12,7 +12,92 @@ const servers = new Map()
 const agySessions = new Map()
 const agyChildren = new Set()
 const pendingActivities = new Map()
+const monitorClients = new Set()
+const monitorHistory = []
+let monitorHistoryBytes = 0
+let monitorEnabled = false
+const MONITOR_HISTORY_LIMIT = 250
+const MONITOR_HISTORY_BYTES = 4 * 1024 * 1024
 const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000
+
+function publishMonitor(direction, payload) {
+  if (!monitorEnabled) return
+  const entry = { time: new Date().toISOString(), direction, payload }
+  let encoded = JSON.stringify(entry)
+  if (Buffer.byteLength(encoded) > MONITOR_HISTORY_BYTES) {
+    entry.payload = { note: "Event too large to retain in monitor history", preview: encoded.slice(0, 64_000) }
+    encoded = JSON.stringify(entry)
+  }
+  const bytes = Buffer.byteLength(encoded)
+  monitorHistory.push({ encoded, bytes })
+  monitorHistoryBytes += bytes
+  while (monitorHistory.length > MONITOR_HISTORY_LIMIT || monitorHistoryBytes > MONITOR_HISTORY_BYTES) {
+    monitorHistoryBytes -= monitorHistory.shift().bytes
+  }
+  for (const client of monitorClients) {
+    if (!client.destroyed) client.write(`data: ${encoded}\n\n`)
+  }
+}
+
+export function setMonitorEnabled(enabled) {
+  monitorEnabled = Boolean(enabled)
+  monitorHistory.length = 0
+  monitorHistoryBytes = 0
+  const encoded = JSON.stringify({
+    time: new Date().toISOString(),
+    direction: "Monitor status",
+    payload: { enabled: monitorEnabled },
+  })
+  for (const client of monitorClients) {
+    if (!client.destroyed) client.write(`data: ${encoded}\n\n`)
+  }
+}
+
+const MONITOR_PAGE = `<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AGY Bridge Monitor</title>
+<style>
+  :root{color-scheme:dark;font:14px/1.5 system-ui,sans-serif;background:#111827;color:#e5e7eb}
+  body{margin:0;padding:24px 24px 100px}h1{font-size:22px;margin:0 0 4px}.note{color:#fbbf24;margin:0 0 18px}
+  #state{color:#9ca3af;margin-bottom:16px}.event{border:1px solid #374151;border-radius:8px;margin:10px 0;padding:12px;background:#1f2937}
+  .head{display:flex;gap:12px;justify-content:space-between;color:#93c5fd;font-weight:600}.time{color:#9ca3af;font-weight:400}
+   pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 0;color:#d1d5db}.wire{margin-top:10px;color:#9ca3af}.wire summary{cursor:pointer}
+  #dock{position:fixed;z-index:10;left:0;right:0;bottom:0;display:flex;align-items:center;gap:12px;padding:12px 24px;background:#030712;border-top:1px solid #374151;box-shadow:0 -8px 24px #0008}
+  button,select{padding:8px 12px;background:#1f2937;color:#e5e7eb;border:1px solid #4b5563;border-radius:6px}
+</style>
+<body><h1>AGY Bridge Monitor</h1>
+<p class="note">Local-only live data. Enable with <code>/agy-monitor-on</code> in OpenCode. AGY stdin shows the readable prompt; expand Raw stream-json stdin line for the exact CLI input. Prompts, files, arguments, and outputs may contain sensitive information; nothing is saved to disk.</p>
+<div id="state">Connecting…</div><main id="events"></main>
+<footer id="dock"><button id="pause">Pause scrolling</button><label for="filter">Filter:</label><select id="filter"><option value="all">All directions</option><option>OpenCode → Bridge HTTP</option><option>Bridge → AGY stdin</option><option>AGY stdout → Bridge</option><option>Bridge → OpenCode SSE</option><option>Monitor status</option></select><span>Pause/filter controls stay fixed here.</span></footer>
+<script>
+const list=document.getElementById("events"),state=document.getElementById("state"),button=document.getElementById("pause"),filter=document.getElementById("filter");
+let paused=false;button.onclick=()=>{paused=!paused;button.textContent=paused?"Resume scrolling":"Pause scrolling"};
+filter.onchange=()=>{for(const card of list.children)card.hidden=filter.value!=="all"&&card.dataset.direction!==filter.value};
+const source=new EventSource("/monitor/events");
+source.onopen=()=>state.textContent="Connected · monitoring is controlled by the OpenCode commands";
+source.onerror=()=>state.textContent="Disconnected · reconnecting…";
+source.onmessage=(message)=>{let item;try{item=JSON.parse(message.data)}catch{return}
+  if(item.direction==="Monitor status"){
+    if(!item.payload.enabled)list.replaceChildren();
+    state.textContent=item.payload.enabled?"Connected · MONITORING ON":"Connected · MONITORING OFF · use /agy-monitor-on in OpenCode";
+    if(!item.payload.enabled)return;
+  }
+  const card=document.createElement("section"),head=document.createElement("div"),direction=document.createElement("span"),time=document.createElement("span"),body=document.createElement("pre");
+  card.className="event";card.dataset.direction=item.direction;card.hidden=filter.value!=="all"&&filter.value!==item.direction;
+  head.className="head";time.className="time";direction.textContent=item.direction;time.textContent=item.time;
+  let wireLine;
+  if(item.direction==="Bridge → AGY stdin"&&typeof item.payload.line==="string"){
+    wireLine=item.payload.line;
+    try{const input=JSON.parse(wireLine);body.textContent=typeof input.message?.content==="string"?input.message.content:wireLine}
+    catch{body.textContent=wireLine}
+  }else body.textContent=item.direction==="AGY stdout → Bridge"&&typeof item.payload.line==="string"
+    ?item.payload.line
+    :JSON.stringify(item.payload,null,2);
+  head.append(direction,time);card.append(head,body);
+  if(wireLine){const details=document.createElement("details"),summary=document.createElement("summary"),raw=document.createElement("pre");details.className="wire";summary.textContent="Raw stream-json stdin line";raw.textContent=wireLine;details.append(summary,raw);card.append(details)}
+  list.append(card);while(list.children.length>250)list.firstChild.remove();if(!paused)window.scrollTo(0,document.body.scrollHeight);
+};
+</script></body></html>`
 
 const MIME_EXTENSIONS = new Map([
   ["image/png", ".png"], ["image/jpeg", ".jpg"], ["image/gif", ".gif"],
@@ -74,35 +159,39 @@ async function saveAttachment(part, directory) {
   return { mime, filePath }
 }
 
-async function promptFrom(messages = [], attachmentDir) {
-  // AGY gets the user's actual latest turn; OpenCode system messages and
-  // transcript history are not rephrased or pasted into this human-facing text.
+async function promptFrom(messages = [], attachmentDir, includeHistory = false) {
   const message = [...messages].reverse().find((item) => item.role === "user")
   if (!message) throw new Error("OpenCode request did not contain a user message")
 
-  const text = []
-  const attachments = []
-  if (typeof message.content === "string") text.push(message.content)
-  else if (Array.isArray(message.content)) {
-    for (const part of message.content) {
-      if (typeof part.text === "string") text.push(part.text)
-      else if (["image_url", "image", "input_image", "file", "input_file"].includes(part.type)) {
-        const attachment = await saveAttachment(part, attachmentDir)
-        if (attachment) attachments.push(`@${attachment.filePath}`)
-        else {
-          const url = attachmentUrl(part)
-          if (url) attachments.push(url)
+  const turns = includeHistory ? messages.filter((item) => item.role === "user" || item.role === "assistant") : [message]
+  const transcript = []
+  for (const turn of turns) {
+    const text = []
+    const attachments = []
+    if (typeof turn.content === "string") text.push(turn.content)
+    else if (Array.isArray(turn.content)) {
+      for (const part of turn.content) {
+        if (typeof part.text === "string") text.push(part.text)
+        else if (["image_url", "image", "input_image", "file", "input_file"].includes(part.type)) {
+          const attachment = await saveAttachment(part, attachmentDir)
+          if (attachment) attachments.push(`@${attachment.filePath}`)
+          else {
+            const url = attachmentUrl(part)
+            if (url) attachments.push(url)
+          }
         }
       }
     }
-  }
 
-  const prompt = text.join("")
-  if (!attachments.length) return prompt
-  return prompt ? `${prompt}\n\n${attachments.join("\n")}` : attachments.join("\n")
+    const prompt = text.join("")
+    const content = !attachments.length ? prompt : prompt ? `${prompt}\n\n${attachments.join("\n")}` : attachments.join("\n")
+    if (includeHistory) transcript.push(`${turn.role === "assistant" ? "Assistant" : "User"}: ${content}`)
+    else return content
+  }
+  return transcript.join("\n\n")
 }
 
-function createAgySession(command, model, key, attachmentDir) {
+function createAgySession(command, model, key, attachmentDir, includeHistory) {
   const args = [
     "--model", model,
     "--add-dir", attachmentDir,
@@ -155,8 +244,9 @@ function createAgySession(command, model, key, attachmentDir) {
     session.idleTimer.unref?.()
   }
 
-  const handleLine = (line) => {
+  const handleLine = (line, wireLine) => {
     if (!line.trim()) return
+    publishMonitor("AGY stdout → Bridge", { line: wireLine })
     let event
     try { event = JSON.parse(line) } catch { return }
     const turn = session.activeTurn
@@ -169,6 +259,7 @@ function createAgySession(command, model, key, attachmentDir) {
       session.activeTurn = undefined
       turn.signal?.removeEventListener("abort", turn.abort)
       turn.resolve(event.result)
+      if (includeHistory) child.stdin.end()
     }
   }
 
@@ -176,7 +267,8 @@ function createAgySession(command, model, key, attachmentDir) {
     session.stdout += chunk
     let newline
     while ((newline = session.stdout.indexOf("\n")) !== -1) {
-      handleLine(session.stdout.slice(0, newline).replace(/\r$/, ""))
+      const wireLine = session.stdout.slice(0, newline + 1)
+      handleLine(wireLine.slice(0, -1).replace(/\r$/, ""), wireLine)
       session.stdout = session.stdout.slice(newline + 1)
     }
   })
@@ -206,7 +298,7 @@ function createAgySession(command, model, key, attachmentDir) {
       if (signal?.aborted) throw signal.reason ?? new Error("Request aborted")
       const turnAttachmentDir = await mkdtemp(join(attachmentDir, "turn-"))
       try {
-        const prompt = await promptFrom(messages, turnAttachmentDir)
+        const prompt = await promptFrom(messages, turnAttachmentDir, includeHistory)
         const result = await new Promise((resolve, reject) => {
           if (session.closed) {
             reject(new Error("AGY chat process is no longer available"))
@@ -216,7 +308,9 @@ function createAgySession(command, model, key, attachmentDir) {
           active.abort = () => dispose(signal.reason ?? new Error("Request aborted"))
           session.activeTurn = active
           signal?.addEventListener("abort", active.abort, { once: true })
-          child.stdin.write(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n", (error) => {
+          const line = JSON.stringify({ event: "user", message: { content: prompt } })
+          publishMonitor("Bridge → AGY stdin", { line: line + "\n" })
+          child.stdin.write(line + "\n", (error) => {
             if (error) dispose(error)
           })
         })
@@ -236,7 +330,7 @@ function createAgySession(command, model, key, attachmentDir) {
   return session
 }
 
-async function getAgySession(command, model, key) {
+async function getAgySession(command, model, key, includeHistory) {
   const existing = agySessions.get(key)
   if (existing) {
     const session = await existing
@@ -244,7 +338,7 @@ async function getAgySession(command, model, key) {
   }
 
   const creating = mkdtemp(join(tmpdir(), "agy-session-attachments-")).then((attachmentDir) =>
-    createAgySession(command, model, key, attachmentDir),
+    createAgySession(command, model, key, attachmentDir, includeHistory),
   )
   agySessions.set(key, creating)
   try {
@@ -280,7 +374,9 @@ function chunk(id, model, created, delta = {}, finishReason = null) {
 }
 
 function writeSse(response, id, model, created, delta, finishReason = null) {
-  response.write(`data: ${JSON.stringify(chunk(id, model, created, delta, finishReason))}\n\n`)
+  const outgoing = chunk(id, model, created, delta, finishReason)
+  publishMonitor("Bridge → OpenCode SSE", outgoing)
+  response.write(`data: ${JSON.stringify(outgoing)}\n\n`)
 }
 
 const ACTIVITY_TOOL_NAMES = new Map([
@@ -440,10 +536,50 @@ function sendActivityToolCalls(response, stream, model, id, created, result, too
 }
 
 async function handle(request, response, command) {
-  // Loopback is not an authentication boundary by itself. Refuse browser-origin
-  // requests (including DNS-rebinding attempts) and unexpected Host headers.
-  if (request.headers.origin || request.headers.host !== `${HOST}:${PORT}`) {
+  // Keep the API closed to browsers; only the exact same-origin monitor page
+  // may open its read-only event stream. The listener itself is loopback-only.
+  const monitorRoute = request.url === "/monitor" || request.url === "/monitor/" || request.url === "/monitor/events"
+  const monitorOrigin = monitorRoute
+    && request.headers["sec-fetch-site"] === "same-origin"
+    && (!request.headers.origin || request.headers.origin === `http://${HOST}:${PORT}`)
+  const monitorNavigation = request.method === "GET"
+    && (request.url === "/monitor" || request.url === "/monitor/")
+    && !request.headers.origin
+    && (!request.headers["sec-fetch-site"] || request.headers["sec-fetch-site"] === "none")
+  if ((request.headers.origin && !monitorOrigin) || (monitorRoute && !monitorOrigin && !monitorNavigation) || request.headers.host !== `${HOST}:${PORT}`) {
     sendJson(response, 403, { error: { message: "Forbidden" } })
+    return
+  }
+  if (request.method === "GET" && (request.url === "/monitor" || request.url === "/monitor/")) {
+    response.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    })
+    response.end(MONITOR_PAGE)
+    return
+  }
+  if (request.method === "GET" && request.url === "/monitor/events") {
+    response.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+      "x-content-type-options": "nosniff",
+    })
+    response.flushHeaders()
+    response.write(`data: ${JSON.stringify({ time: new Date().toISOString(), direction: "Monitor status", payload: { enabled: monitorEnabled } })}\n\n`)
+    for (const item of monitorHistory) response.write(`data: ${item.encoded}\n\n`)
+    monitorClients.add(response)
+    response.once("close", () => monitorClients.delete(response))
+    return
+  }
+  if (request.method === "POST" && (request.url === "/monitor/control/on" || request.url === "/monitor/control/off")) {
+    const enabled = request.url.endsWith("/on")
+    setMonitorEnabled(enabled)
+    sendJson(response, 200, { enabled: monitorEnabled })
     return
   }
   if (request.method === "GET" && request.url === "/healthz") {
@@ -470,6 +606,7 @@ async function handle(request, response, command) {
     sendJson(response, 400, { error: { message: "Invalid JSON body" } })
     return
   }
+  publishMonitor("OpenCode → Bridge HTTP", { raw })
 
   const model = String(body.model ?? "").replace(/^agy-cli\//, "")
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(model)) {
@@ -515,7 +652,7 @@ async function handle(request, response, command) {
   }
 
   try {
-    session = await getAgySession(command, model, sessionKey)
+    session = await getAgySession(command, model, sessionKey, !persistent)
     const result = await session.runTurn(body.messages, (event) => {
       if (controller.signal.aborted || response.destroyed) return
       if (event.event === "step_update" && event.step_update?.step_type === "agent_response") {

@@ -54,13 +54,31 @@ function parseModels(output: string) {
 
 export default {
   id: "agy-model-provider",
-  "chat.headers": async (input: { sessionID: string; model: { providerID: string } }, output: { headers: Record<string, string> }) => {
-    if (input.model.providerID === providerID) output.headers["x-opencode-session"] = input.sessionID
-  },
   async setup(ctx) {
     const command = agyCommand()
-    const { startBridge } = await import("../runtime/agy-openai-bridge.mjs")
+    const { startBridge, setMonitorEnabled } = await import("../runtime/agy-openai-bridge.mjs")
     await startBridge(command)
+    await ctx.session.hook("model.request", (event) => {
+      event.headers["x-opencode-session"] = event.sessionID
+    }, { providerID })
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: "agy-monitor-on",
+        description: "Enable the local live monitor for AGY bridge traffic",
+        execute: async ({ sessionID }) => {
+          setMonitorEnabled(true)
+          await ctx.session.synthetic({ sessionID, text: "AGY bridge monitor enabled at http://127.0.0.1:47381/monitor." })
+        },
+      })
+      editor.add({
+        name: "agy-monitor-off",
+        description: "Disable AGY bridge traffic monitoring and clear its in-memory event buffer",
+        execute: async ({ sessionID }) => {
+          setMonitorEnabled(false)
+          await ctx.session.synthetic({ sessionID, text: "AGY bridge monitor disabled; its in-memory event buffer was cleared." })
+        },
+      })
+    })
 
     let available: { id: string; name: string }[]
     try {
