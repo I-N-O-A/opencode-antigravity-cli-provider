@@ -1,8 +1,8 @@
 # Antigravity CLI for OpenCode
 
-> **LET YOUR LLM DO IT. LET YOUR AGENT DO IT.**
->
-> **LOWEST-RISK APPROACH:** OpenCode calls the official `agy` CLI locally. No direct Antigravity API calls, custom OAuth, or project-stored credentials. Google receives a request made through `agy`, much like one you start yourself in a terminal. Google may still identify the client; this is not a promise of invisibility or zero risk.
+
+
+> **LOWEST-RISK APPROACH:** OpenCode calls the official `agy` CLI locally. No direct Antigravity API calls, custom OAuth, or project-stored credentials. Google receives a request made through `agy`, much like one you start manually in your terminal.
 
 ## Let your agent install it
 
