@@ -60,6 +60,7 @@ export default {
     await startBridge(command)
     await ctx.session.hook("model.request", (event) => {
       event.headers["x-opencode-session"] = event.sessionID
+      event.headers["x-opencode-agent"] = event.agent
     }, { providerID })
     await ctx.command.transform((editor) => {
       editor.add({

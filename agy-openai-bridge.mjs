@@ -191,10 +191,11 @@ async function promptFrom(messages = [], attachmentDir, includeHistory = false) 
   return transcript.join("\n\n")
 }
 
-function createAgySession(command, model, key, attachmentDir, includeHistory) {
+function createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory = false, mode = "default") {
   const args = [
     "--model", model,
     "--add-dir", attachmentDir,
+    ...(mode === "plan" ? ["--mode=plan"] : []),
     "--input-format", "stream-json",
     "--output-format", "stream-json",
   ]
@@ -213,6 +214,7 @@ function createAgySession(command, model, key, attachmentDir, includeHistory) {
     busy: 0,
     idleTimer: undefined,
     closed: false,
+    seedHistory,
   }
 
   const removeSession = () => {
@@ -298,7 +300,8 @@ function createAgySession(command, model, key, attachmentDir, includeHistory) {
       if (signal?.aborted) throw signal.reason ?? new Error("Request aborted")
       const turnAttachmentDir = await mkdtemp(join(attachmentDir, "turn-"))
       try {
-        const prompt = await promptFrom(messages, turnAttachmentDir, includeHistory)
+        const prompt = await promptFrom(messages, turnAttachmentDir, includeHistory || session.seedHistory)
+        session.seedHistory = false
         const result = await new Promise((resolve, reject) => {
           if (session.closed) {
             reject(new Error("AGY chat process is no longer available"))
@@ -330,15 +333,26 @@ function createAgySession(command, model, key, attachmentDir, includeHistory) {
   return session
 }
 
-async function getAgySession(command, model, key, includeHistory) {
+async function getAgySession(command, model, key, includeHistory, mode = "default") {
   const existing = agySessions.get(key)
   if (existing) {
     const session = await existing
     if (!session.closed) return session
   }
 
+  let seedHistory = false
+  const sessionPrefix = `${key.slice(0, key.lastIndexOf(":"))}:`
+  for (const [otherKey, value] of agySessions) {
+    if (otherKey === key || !otherKey.startsWith(sessionPrefix)) continue
+    const previous = await value
+    if (!previous.closed) {
+      seedHistory = true
+      if (previous.busy === 0) previous.dispose(new Error("AGY execution mode changed; starting a session with the new mode"))
+    }
+  }
+
   const creating = mkdtemp(join(tmpdir(), "agy-session-attachments-")).then((attachmentDir) =>
-    createAgySession(command, model, key, attachmentDir, includeHistory),
+    createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory, mode),
   )
   agySessions.set(key, creating)
   try {
@@ -377,6 +391,11 @@ function writeSse(response, id, model, created, delta, finishReason = null) {
   const outgoing = chunk(id, model, created, delta, finishReason)
   publishMonitor("Bridge → OpenCode SSE", outgoing)
   response.write(`data: ${JSON.stringify(outgoing)}\n\n`)
+}
+
+function openCodeMode(headers = {}) {
+  const agent = String(headers["x-opencode-agent"] ?? "").trim().toLowerCase()
+  return agent === "plan" ? "plan" : "default"
 }
 
 const ACTIVITY_TOOL_NAMES = new Map([
@@ -624,7 +643,8 @@ async function handle(request, response, command) {
 
   const sessionId = request.headers["x-opencode-session"]
   const persistent = typeof sessionId === "string" && sessionId.length > 0
-  const sessionKey = persistent ? `${sessionId}:${model}` : randomUUID()
+  const mode = openCodeMode(request.headers)
+  const sessionKey = persistent ? `${sessionId}:${model}:${mode}` : randomUUID()
   const controller = new AbortController()
   response.once("close", () => {
     if (!response.writableEnded) controller.abort()
@@ -652,7 +672,7 @@ async function handle(request, response, command) {
   }
 
   try {
-    session = await getAgySession(command, model, sessionKey, !persistent)
+    session = await getAgySession(command, model, sessionKey, !persistent, mode)
     const result = await session.runTurn(body.messages, (event) => {
       if (controller.signal.aborted || response.destroyed) return
       if (event.event === "step_update" && event.step_update?.step_type === "agent_response") {
