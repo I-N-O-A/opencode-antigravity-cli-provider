@@ -5,6 +5,58 @@ import { spawn } from "node:child_process"
 const providerID = "agy-cli"
 const MODEL_LINE = /^([a-z0-9][a-z0-9._-]*)\s+(.+?)\s*$/i
 const MONITOR_URL = "http://127.0.0.1:47381/monitor"
+const MODEL_CACHE_KEY = "catalog/models"
+const MODEL_LIMITS: Record<string, { context: number; output: number }> = {
+  "claude-opus-4-6-thinking": { context: 200_000, output: 65_536 },
+  "claude-sonnet-4-6": { context: 200_000, output: 65_536 },
+  "gemini-3.1-pro-high": { context: 1_000_000, output: 65_536 },
+  "gemini-3.1-pro-low": { context: 1_000_000, output: 65_536 },
+  "gemini-3.6-flash-high": { context: 1_000_000, output: 65_536 },
+  "gemini-3.6-flash-medium": { context: 1_000_000, output: 65_536 },
+  "gemini-3.6-flash-low": { context: 1_000_000, output: 65_536 },
+  "gemini-3.7-flash-high": { context: 1_000_000, output: 65_536 },
+  "gemini-3.7-flash-medium": { context: 1_000_000, output: 65_536 },
+  "gemini-3.7-flash-low": { context: 1_000_000, output: 65_536 },
+  "gemini-3.8-flash-high": { context: 1_000_000, output: 65_536 },
+  "gemini-3.8-flash-medium": { context: 1_000_000, output: 65_536 },
+  "gemini-3.8-flash-low": { context: 1_000_000, output: 65_536 },
+  "gpt-oss-120b-medium": { context: 128_000, output: 65_536 },
+}
+
+type DiscoveredModel = { id: string; name: string }
+
+function modelDefinitions(models: DiscoveredModel[], template?: any) {
+  return models.map(({ id, name }) => {
+    const defaults = template
+      ? JSON.parse(JSON.stringify(template))
+        : {
+          id,
+          modelID: id,
+          providerID,
+          name,
+          api: { id, type: "aisdk", package: "@opencode/ai/providers/openai-compatible" },
+          capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+          request: { headers: {}, body: {} },
+          variants: [],
+          time: { released: 0 },
+          cost: [],
+          status: "active",
+          enabled: true,
+          limit: { context: 200_000, output: 32_000 },
+        }
+    const limit = MODEL_LIMITS[id]
+    return {
+      ...defaults,
+      id,
+      modelID: id,
+      providerID,
+      name,
+      api: { ...defaults.api, id },
+      capabilities: { ...defaults.capabilities, tools: true, input: ["text", "image"], output: ["text"] },
+      limit: limit ?? { context: 200_000, output: 32_000 },
+    }
+  })
+}
 
 function openMonitor() {
   let command: string
@@ -22,6 +74,22 @@ function openMonitor() {
   const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true })
   child.once("error", (error) => console.warn("[agy-model-provider] Could not open monitor URL:", error))
   child.unref()
+}
+
+async function controlMonitor(enabled: boolean) {
+  const baseURL = "http://127.0.0.1:47381"
+  const response = await fetch(`${baseURL}/monitor/control/${enabled ? "on" : "off"}`, {
+    method: "POST",
+    headers: {
+      origin: baseURL,
+      "sec-fetch-site": "same-origin",
+    },
+    signal: AbortSignal.timeout(3_000),
+  })
+  const result = await response.json().catch(() => ({})) as { enabled?: boolean; error?: { message?: string } }
+  if (!response.ok || result.enabled !== enabled) {
+    throw new Error(result.error?.message ?? `Monitor control failed with HTTP ${response.status}; restart OpenCode to load the current bridge.`)
+  }
 }
 
 function agyCommand() {
@@ -75,7 +143,7 @@ export default {
   id: "agy-model-provider",
   async setup(ctx) {
     const command = agyCommand()
-    const { startBridge, setMonitorEnabled } = await import("../runtime/agy-openai-bridge.mjs")
+    const { startBridge } = await import("../runtime/agy-openai-bridge.mjs")
     await startBridge(command)
     await ctx.session.hook("model.request", (event) => {
       event.headers["x-opencode-session"] = event.sessionID
@@ -86,7 +154,7 @@ export default {
         name: "agy-monitor-on",
         description: "Enable the local live monitor without adding a chat message",
         execute: async () => {
-          setMonitorEnabled(true)
+          await controlMonitor(true)
           openMonitor()
         },
       })
@@ -94,23 +162,57 @@ export default {
         name: "agy-monitor-off",
         description: "Disable AGY bridge monitoring without adding a chat message",
         execute: async () => {
-          setMonitorEnabled(false)
+          await controlMonitor(false)
         },
       })
     })
     let available: { id: string; name: string }[]
     try {
       available = parseModels(await runAgyModels(command))
+      if (available.length === 0) throw new Error("agy models returned no parseable models")
     } catch (error) {
       console.warn(`[agy-model-provider] Could not discover models using ${command}:`, error)
-      return
+      let cached: unknown
+      try {
+        cached = await ctx.storage.get(MODEL_CACHE_KEY)
+      } catch (cacheError) {
+        console.warn("[agy-model-provider] Could not read the saved model catalog:", cacheError)
+      }
+      available = Array.isArray(cached)
+        ? cached.filter((model): model is DiscoveredModel =>
+            typeof model === "object" && model !== null &&
+            typeof (model as DiscoveredModel).id === "string" &&
+            typeof (model as DiscoveredModel).name === "string")
+        : []
+      if (available.length === 0) {
+        console.warn("[agy-model-provider] No cached AGY model catalog; OpenCode will start without AGY models.")
+        return
+      }
+      console.warn(`[agy-model-provider] Using the last saved catalog (${available.length} models).`)
     }
 
-    if (available.length === 0) {
-      console.warn("[agy-model-provider] agy models returned no models; provider was not registered.")
-      return
+    try {
+      await ctx.storage.set(MODEL_CACHE_KEY, available)
+    } catch (error) {
+      console.warn("[agy-model-provider] Could not save the discovered model catalog:", error)
     }
 
-    console.log(`[agy-model-provider] Bridge ready; discovered ${available.length} agy models.`)
+    await ctx.provider.transform((editor) => {
+      const existing = editor.get(providerID)
+      if (existing) {
+        const template = existing.models.values().next().value
+        editor.models.set(providerID, modelDefinitions(available, template))
+      } else {
+        const info = {
+          id: providerID,
+          name: "Antigravity CLI (agy)",
+          api: { type: "aisdk", package: "@opencode/ai/providers/openai-compatible", url: "http://127.0.0.1:47381/v1" },
+          request: { headers: {}, body: { timeout: 1_800_000 } },
+        }
+        editor.add({ info, models: modelDefinitions(available) })
+      }
+    })
+
+    console.log(`[agy-model-provider] Bridge ready; registered ${available.length} AGY models in OpenCode's runtime catalog.`)
   },
 }

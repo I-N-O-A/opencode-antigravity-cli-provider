@@ -68,10 +68,13 @@ const MONITOR_PAGE = `<!doctype html>
 <body><h1>AGY Bridge Monitor</h1>
 <p class="note">Local-only live data. Enable with <code>/agy-monitor-on</code> in OpenCode. AGY stdin shows the readable prompt; expand Raw stream-json stdin line for the exact CLI input. Prompts, files, arguments, and outputs may contain sensitive information; nothing is saved to disk.</p>
 <div id="state">Connecting…</div><main id="events"></main>
-<footer id="dock"><button id="pause">Pause scrolling</button><label for="filter">Filter:</label><select id="filter"><option value="all">All directions</option><option>OpenCode → Bridge HTTP</option><option>Bridge → AGY stdin</option><option>AGY stdout → Bridge</option><option>Bridge → OpenCode SSE</option><option>Monitor status</option></select><span>Pause/filter controls stay fixed here.</span></footer>
+<footer id="dock"><button id="toggle" type="button" aria-pressed="false">Turn monitoring on</button><button id="pause" type="button">Pause scrolling</button><label for="filter">Filter:</label><select id="filter"><option value="all">All directions</option><option>OpenCode → Bridge HTTP</option><option>Bridge → AGY stdin</option><option>AGY stdout → Bridge</option><option>Bridge → OpenCode SSE</option><option>Monitor status</option></select><span>Toggle controls collection; pause only affects scrolling.</span></footer>
 <script>
-const list=document.getElementById("events"),state=document.getElementById("state"),button=document.getElementById("pause"),filter=document.getElementById("filter");
-let paused=false;button.onclick=()=>{paused=!paused;button.textContent=paused?"Resume scrolling":"Pause scrolling"};
+const list=document.getElementById("events"),state=document.getElementById("state"),button=document.getElementById("pause"),toggle=document.getElementById("toggle"),filter=document.getElementById("filter");
+let paused=false,monitoring=false;
+function showMonitorState(enabled){monitoring=enabled;toggle.textContent=enabled?"Turn monitoring off":"Turn monitoring on";toggle.setAttribute("aria-pressed",String(enabled));state.textContent=enabled?"Connected · MONITORING ON":"Connected · MONITORING OFF"}
+toggle.onclick=async()=>{toggle.disabled=true;try{const response=await fetch("/monitor/control/"+(monitoring?"off":"on"),{method:"POST",credentials:"same-origin"});if(!response.ok)throw new Error("HTTP "+response.status);const result=await response.json();showMonitorState(Boolean(result.enabled))}catch(error){state.textContent="Could not change monitor state: "+error.message}finally{toggle.disabled=false}};
+button.onclick=()=>{paused=!paused;button.textContent=paused?"Resume scrolling":"Pause scrolling"};
 filter.onchange=()=>{for(const card of list.children)card.hidden=filter.value!=="all"&&card.dataset.direction!==filter.value};
 const source=new EventSource("/monitor/events");
 source.onopen=()=>state.textContent="Connected · monitoring is controlled by the OpenCode commands";
@@ -79,7 +82,7 @@ source.onerror=()=>state.textContent="Disconnected · reconnecting…";
 source.onmessage=(message)=>{let item;try{item=JSON.parse(message.data)}catch{return}
   if(item.direction==="Monitor status"){
     if(!item.payload.enabled)list.replaceChildren();
-    state.textContent=item.payload.enabled?"Connected · MONITORING ON":"Connected · MONITORING OFF · use /agy-monitor-on in OpenCode";
+    showMonitorState(Boolean(item.payload.enabled));
     if(!item.payload.enabled)return;
   }
   const card=document.createElement("section"),head=document.createElement("div"),direction=document.createElement("span"),time=document.createElement("span"),body=document.createElement("pre");
@@ -556,8 +559,9 @@ function sendActivityToolCalls(response, stream, model, id, created, result, too
 
 async function handle(request, response, command) {
   // Keep the API closed to browsers; only the exact same-origin monitor page
-  // may open its read-only event stream. The listener itself is loopback-only.
+  // may read events or toggle capture. The listener itself is loopback-only.
   const monitorRoute = request.url === "/monitor" || request.url === "/monitor/" || request.url === "/monitor/events"
+    || request.url === "/monitor/control/on" || request.url === "/monitor/control/off"
   const monitorOrigin = monitorRoute
     && request.headers["sec-fetch-site"] === "same-origin"
     && (!request.headers.origin || request.headers.origin === `http://${HOST}:${PORT}`)
