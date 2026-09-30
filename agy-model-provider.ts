@@ -6,17 +6,6 @@ const providerID = "agy-cli"
 const MODEL_LINE = /^([a-z0-9][a-z0-9._-]*)\s+(.+?)\s*$/i
 const MONITOR_URL = "http://127.0.0.1:47381/monitor"
 
-function openMonitorPage() {
-  const [command, args] = process.platform === "win32"
-    ? ["powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `Start-Process -FilePath '${MONITOR_URL}'`]]
-    : process.platform === "darwin"
-      ? ["open", [MONITOR_URL]]
-      : ["xdg-open", [MONITOR_URL]]
-  const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true })
-  child.once("error", (error) => console.warn(`[agy-model-provider] Could not open monitor browser: ${error.message}`))
-  child.unref()
-}
-
 function agyCommand() {
   const local = process.env.LOCALAPPDATA
   if (local) {
@@ -80,10 +69,9 @@ export default {
         description: "Enable the local live monitor for AGY bridge traffic",
         execute: async ({ sessionID }) => {
           setMonitorEnabled(true)
-          openMonitorPage()
           await ctx.session.synthetic({
             sessionID,
-            text: `AGY monitor enabled. Opening browser: ${MONITOR_URL}`,
+            text: MONITOR_URL,
           })
         },
       })
