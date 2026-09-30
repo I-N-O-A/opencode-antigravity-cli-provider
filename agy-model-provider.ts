@@ -4,6 +4,25 @@ import { spawn } from "node:child_process"
 
 const providerID = "agy-cli"
 const MODEL_LINE = /^([a-z0-9][a-z0-9._-]*)\s+(.+?)\s*$/i
+const MONITOR_URL = "http://127.0.0.1:47381/monitor"
+
+function openMonitor() {
+  let command: string
+  let args: string[]
+  if (process.platform === "win32") {
+    command = "rundll32.exe"
+    args = ["url.dll,FileProtocolHandler", MONITOR_URL]
+  } else if (process.platform === "darwin") {
+    command = "open"
+    args = [MONITOR_URL]
+  } else {
+    command = "xdg-open"
+    args = [MONITOR_URL]
+  }
+  const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true })
+  child.once("error", (error) => console.warn("[agy-model-provider] Could not open monitor URL:", error))
+  child.unref()
+}
 
 function agyCommand() {
   const local = process.env.LOCALAPPDATA
@@ -65,20 +84,20 @@ export default {
     await ctx.command.transform((editor) => {
       editor.add({
         name: "agy-monitor-on",
-        description: "Enable the local live monitor for AGY bridge traffic",
+        description: "Enable the local live monitor without adding a chat message",
         execute: async () => {
           setMonitorEnabled(true)
+          openMonitor()
         },
       })
       editor.add({
         name: "agy-monitor-off",
-        description: "Disable AGY bridge traffic monitoring and clear its in-memory event buffer",
+        description: "Disable AGY bridge monitoring without adding a chat message",
         execute: async () => {
           setMonitorEnabled(false)
         },
       })
     })
-
     let available: { id: string; name: string }[]
     try {
       available = parseModels(await runAgyModels(command))
