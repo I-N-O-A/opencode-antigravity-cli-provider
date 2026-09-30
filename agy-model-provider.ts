@@ -66,17 +66,15 @@ export default {
       editor.add({
         name: "agy-monitor-on",
         description: "Enable the local live monitor for AGY bridge traffic",
-        execute: async ({ sessionID }) => {
+        execute: async () => {
           setMonitorEnabled(true)
-          await ctx.session.synthetic({ sessionID, text: "AGY bridge monitor enabled at http://127.0.0.1:47381/monitor." })
         },
       })
       editor.add({
         name: "agy-monitor-off",
         description: "Disable AGY bridge traffic monitoring and clear its in-memory event buffer",
-        execute: async ({ sessionID }) => {
+        execute: async () => {
           setMonitorEnabled(false)
-          await ctx.session.synthetic({ sessionID, text: "AGY bridge monitor disabled; its in-memory event buffer was cleared." })
         },
       })
     })
