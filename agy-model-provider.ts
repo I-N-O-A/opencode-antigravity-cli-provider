@@ -8,7 +8,7 @@ const MONITOR_URL = "http://127.0.0.1:47381/monitor"
 
 function openMonitorPage() {
   const [command, args] = process.platform === "win32"
-    ? ["cmd.exe", ["/d", "/s", "/c", `start "" "${MONITOR_URL}"`]]
+    ? ["rundll32.exe", ["url.dll,FileProtocolHandler", MONITOR_URL]]
     : process.platform === "darwin"
       ? ["open", [MONITOR_URL]]
       : ["xdg-open", [MONITOR_URL]]
