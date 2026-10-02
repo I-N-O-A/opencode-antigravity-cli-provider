@@ -9,7 +9,7 @@ import { join } from "node:path"
 import { forwardSessionContext } from "../agy-model-provider.ts"
 
 process.env.AGY_BRIDGE_PORT = "49381"
-const { handle, createAgySession, conversationStore, runBoundTurn, ConversationMismatch, openCodeMode, primaryModePrompt } = await import("../agy-openai-bridge.mjs")
+const { handle, createAgySession, conversationStore, runBoundTurn, ConversationMismatch, openCodeMode, primaryModePrompt, summaryText, fallbackCheckpoint } = await import("../agy-openai-bridge.mjs")
 const tools = [{ type: "function", function: { name: "agy_read" } }]
 const failure = { event: "step_update", step_update: {
   step_type: "tool", step_index: 0, tool_name: "view_file", state: "ERROR",
@@ -144,7 +144,7 @@ test("plan mode is never automatically continued or approved", async (t) => {
 })
 
 test("compaction is isolated, includes history, and emits no display calls", async (t) => {
-  const f = await fixture(t, [{ events: [failure], result: { status: "SUCCESS", response: "Summary" } }])
+  const f = await fixture(t, [{ result: { status: "SUCCESS", response: "Summary" } }])
   const result = await f.post(user, false, { "x-opencode-kind": "compaction", "x-opencode-agent": "plan" })
   assert.equal(f.factories[0][3], true, "one-shot includes history")
   assert.equal(f.factories[0][4], "default")
@@ -345,4 +345,124 @@ test("mode boundary labels old plan reminders as historical without approving un
   assert.ok(build.includes(history), "do not erase the user's history or permissions")
   assert.match(primaryModePrompt(history, "plan", true), /do not implement changes/)
   assert.equal(primaryModePrompt(history, "default", false), history, "auxiliary summaries get no execution instructions")
+})
+
+for (const stream of [false, true]) {
+  test(`empty compaction retries in isolated sessions and returns only a validated summary (stream=${stream})`, async (t) => {
+    const f = await fixture(t, [
+      { result: { status: "SUCCESS", response: null, usage: { input_tokens: 2 } } },
+      { result: { status: "SUCCESS", response: " \n ", usage: { input_tokens: 3 } } },
+      { result: { status: "SUCCESS", response: "## Summary\nGoal: preserve current work.\nNext: implement the agreed fix.", usage: { input_tokens: 4 } } },
+    ])
+    const result = await f.post(user, stream, { "x-opencode-kind": "compaction" })
+    assert.equal(result.status, 200)
+    assert.equal(f.inputs.length, 3)
+    assert.equal(f.factories.length, 3)
+    assert.equal(new Set(f.factories.map((args) => args[2])).size, 3)
+    for (const input of f.inputs) {
+      assert.equal(input[0].content, user[0].content)
+      assert.match(input.at(-1).content, /do not call tools/)
+    }
+    assert.match(result.raw, /preserve current work/)
+    assert.doesNotMatch(result.raw, /keine abschließende Antwort|"content":null|tool_calls/)
+    if (stream) assert.equal(result.chunks.at(-1).choices[0].finish_reason, "stop")
+    else assert.equal(result.body.usage.prompt_tokens, 9)
+  })
+
+  test(`three empty compactions recover with factual excerpts instead of stopping (stream=${stream})`, async (t) => {
+    const f = await fixture(t, Array.from({ length: 3 }, () => ({ result: { status: "SUCCESS", response: null } })))
+    const result = await f.post(user, stream, { "x-opencode-kind": "compaction" })
+    assert.equal(result.status, 200)
+    assert.match(result.raw, /no non-empty summary after 3/)
+    assert.match(result.raw, /local recovery/)
+    assert.match(result.raw, /Perform allowed work/)
+    assert.doesNotMatch(result.raw, /keine abschließende/)
+    if (stream) assert.equal(result.chunks.at(-1).choices[0].finish_reason, "stop")
+    else assert.ok(result.body.choices[0].message.content.trim().length > 100)
+    assert.equal(f.inputs.length, 3)
+  })
+}
+
+test("whitespace result falls back to valid streamed compaction text", async (t) => {
+  const f = await fixture(t, [{ result: { status: "SUCCESS", response: "   " }, events: [
+    { event: "step_update", step_update: { step_type: "agent_response", text_delta: "Actual summary of completed and remaining work." } },
+  ] }])
+  const result = await f.post(user, true, { "x-opencode-kind": "compaction" })
+  assert.equal(result.status, 200)
+  assert.match(result.raw, /Actual summary/)
+  assert.equal(f.inputs.length, 1)
+})
+
+test("compaction errors recover from supplied history, not the failed response text", async (t) => {
+  const f = await fixture(t, [{ result: { status: "ERROR", response: "Authentication failed", error: null } }])
+  const result = await f.post(user, true, { "x-opencode-kind": "compaction" })
+  assert.equal(result.status, 200)
+  assert.match(result.raw, /compaction failed/)
+  assert.match(result.raw, /Perform allowed work/)
+  assert.match(result.raw, /local recovery/)
+  assert.doesNotMatch(result.raw, /Authentication failed/)
+  assert.equal(f.inputs.length, 1)
+})
+
+test("compaction tool execution is stopped and recovered without replaying it", async (t) => {
+  const f = await fixture(t, [{ events: [failure], result: { status: "SUCCESS", response: "" } }])
+  const result = await f.post(user, true, { "x-opencode-kind": "compaction" })
+  assert.equal(result.status, 200)
+  assert.match(result.raw, /attempted tool execution/)
+  assert.match(result.raw, /local recovery/)
+  assert.equal(f.inputs.length, 1)
+})
+
+test("summary validator rejects null placeholders and non-text values", () => {
+  for (const response of [null, undefined, "", " \n ", "null", "undefined", "[object Object]", {}, []]) {
+    assert.equal(summaryText({ response }, ""), "")
+  }
+  assert.equal(summaryText({ response: "null" }, "Valid streamed summary"), "Valid streamed summary")
+})
+
+test("compaction process failure provides a checkpoint so the prompt can continue", async (t) => {
+  const f = await fixture(t, [{ throw: "CLI process crashed" }])
+  const result = await f.post(user, true, { "x-opencode-kind": "compaction" })
+  assert.equal(result.status, 200)
+  assert.match(result.raw, /Perform allowed work/)
+  assert.match(result.raw, /context recovery, NOT task completion/)
+  assert.equal(result.chunks.at(-1).choices[0].finish_reason, "stop")
+})
+
+test("local fallback is bounded, grounded in only supplied history and retains denial constraints", () => {
+  const source = [
+    { role: "system", content: "Do not write outside project A." },
+    { role: "user", content: "Implement SESSION_A_ONLY." },
+    { role: "assistant", content: "Plan approved for task A, tests still pending." },
+    { role: "tool", content: "Permission denied for forbidden.txt. Do not retry." },
+    { role: "user", content: "Continue permitted work A." },
+  ]
+  const checkpoint = fallbackCheckpoint(source, "Empty summarization")
+  assert.match(checkpoint, /SESSION_A_ONLY/)
+  assert.match(checkpoint, /tests still pending/)
+  assert.match(checkpoint, /Do not write outside project A/)
+  assert.match(checkpoint, /Permission denied/)
+  assert.match(checkpoint, /not instructions to repeat/)
+  assert.doesNotMatch(checkpoint, /SESSION_B/)
+  const large = source.map((message) => ({ ...message, content: message.content.repeat(10_000) }))
+  const limited = fallbackCheckpoint(large)
+  assert.ok(limited.length < 34_000)
+  assert.match(limited, /omitted/)
+  assert.equal(source.at(-1).content, "Continue permitted work A.", "do not modify original transcript")
+})
+
+test("primary prompt can continue after recovered compaction without a provider error", async (t) => {
+  const f = await fixture(t, [
+    { throw: "Summarizer failed" },
+    { result: { status: "SUCCESS", response: "Continued the permitted task." } },
+  ])
+  const compact = await f.post(user, false, { "x-opencode-kind": "compaction" })
+  assert.equal(compact.status, 200)
+  const summary = compact.body.choices[0].message.content
+  const continued = await f.post([{ role: "user", content: `<conversation-checkpoint>${summary}</conversation-checkpoint>\nContinue the original permitted task.` }])
+  assert.equal(continued.status, 200)
+  assert.equal(continued.body.choices[0].message.content, "Continued the permitted task.")
+  assert.equal(f.inputs.length, 2)
+  assert.equal(f.factories[0][3], true)
+  assert.equal(f.factories[1][3], false)
 })

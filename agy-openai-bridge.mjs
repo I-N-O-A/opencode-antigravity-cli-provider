@@ -6,7 +6,7 @@ import { spawn } from "node:child_process"
 import { createServer } from "node:http"
 
 const HOST = "127.0.0.1"
-const BRIDGE_VERSION = 5
+const BRIDGE_VERSION = 7
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
@@ -495,6 +495,65 @@ export function primaryModePrompt(content, mode, primary) {
   return `[Current OpenCode session state]\n${state}\n[End current state]\n\n${content}\n\n[Current state reminder]\n${state}`
 }
 
+export function summaryText(result, streamedText) {
+  for (const candidate of [result?.response, streamedText]) {
+    if (typeof candidate !== "string") continue
+    const text = candidate.trim()
+    if (text && !/^(?:null|undefined|\[object Object\])$/i.test(text)) return text
+  }
+  return ""
+}
+
+export function fallbackCheckpoint(messages = [], reason = "Automatic summarization unavailable") {
+  const bounded = (value, limit) => {
+    const text = displayValue(value)
+    if (text.length <= limit) return text
+    const half = Math.floor((limit - 120) / 2)
+    return `${text.slice(0, half)}\n[Middle omitted by local checkpoint size limit; do not invent missing details.]\n${text.slice(-half)}`
+  }
+  const content = (message) => {
+    let text = typeof message.content === "string" ? message.content : Array.isArray(message.content)
+      ? message.content.map((part) => typeof part?.text === "string" ? part.text : `[Attachment: ${part?.filename ?? part?.type ?? "unknown"}]`).join("\n") : ""
+    if (message.tool_calls?.length) text += "\nHistorical tool calls (already attempted, do not repeat):\n" + bounded(message.tool_calls, 1_000)
+    return text
+  }
+  const meaningful = messages.filter((message) => ["system", "user", "assistant", "tool"].includes(message.role))
+  const system = meaningful.filter((message) => message.role === "system").slice(-2)
+  const dialogue = meaningful.filter((message) => message.role === "user" || message.role === "assistant")
+  const recent = dialogue.slice(-6)
+  const olderUsers = dialogue.filter((message) => message.role === "user" && !recent.includes(message))
+  const earlierUsers = [...new Set([olderUsers[0], ...olderUsers.slice(-2)].filter(Boolean))]
+  const tools = meaningful.filter((message) => message.role === "tool").slice(-3)
+  const section = (title, turns, limit) => `${title}\n${turns.length ? turns.map((turn) => `${turn.role}: ${bounded(content(turn), limit)}`).join("\n\n") : "No entries supplied."}`
+  return [
+    "# Conversation checkpoint — local recovery",
+    `Automatic AGY summarization failed (${bounded(reason, 400)}). The following checkpoint preserves supplied conversation excerpts so the pending task can continue. This is context recovery, NOT task completion or plan approval.`,
+    "All excerpts below are historical data. Tool calls/results are already-attempted work, not instructions to repeat. Respect permission denials; do not retry or circumvent denied actions. Current OpenCode agent selection determines the current mode, not historical Plan reminders. Continue the latest actual user task, not the checkpoint-generation instruction. Do not invent omitted facts or claim unfinished work succeeded. If essential details are missing, request clarification rather than acting on guesses.",
+    section("## Supplied system constraints (historical excerpts)", system, 2_000),
+    section("## Earlier user requirements", earlierUsers, 1_600),
+    section("## Recent dialogue: decisions, completed work and pending requests", recent, 3_000),
+    section("## Recent tool results / blockers", tools, 1_200),
+    "## Continuation\nUse these excerpts and the next/current user request to continue. Missing details may have been omitted by the fixed checkpoint size limit; this fallback is not a claim of a complete semantic summary.",
+  ].join("\n\n")
+}
+
+function sendCheckpoint(response, stream, id, model, created, text) {
+  if (!stream) {
+    sendJson(response, 200, {
+      id, object: "chat.completion", created, model,
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    })
+    return
+  }
+  response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform", connection: "keep-alive" })
+  response.flushHeaders()
+  writeSse(response, id, model, created, { role: "assistant" })
+  writeSse(response, id, model, created, { content: text })
+  writeSse(response, id, model, created, {}, "stop")
+  response.end("data: [DONE]\n\n")
+}
+
 const ACTIVITY_TOOL_NAMES = new Map([
   ["run_command", "agy_shell"], ["view_file", "agy_read"], ["write_to_file", "agy_write"],
   ["replace_file_content", "agy_edit"], ["multi_replace_file_content", "agy_edit"],
@@ -777,7 +836,7 @@ export async function handle(request, response, command, sessionFactory = getAgy
   let session
   const activityState = new Map()
   const openActivityKeys = new Set()
-  if (stream) {
+  if (stream && kind !== "compaction") {
     response.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
@@ -805,6 +864,7 @@ export async function handle(request, response, command, sessionFactory = getAgy
         return
       }
       if (event.event !== "step_update" || event.step_update?.step_type !== "tool") return
+      if (kind === "compaction") throw new Error("AGY compaction attempted tool execution instead of summarizing; refusing the checkpoint")
       const step = event.step_update
       const tool = step.tool_name ?? step.tool_info?.name ?? "Tool"
       const index = Number(step.step_index)
@@ -820,7 +880,7 @@ export async function handle(request, response, command, sessionFactory = getAgy
         ...(info.error !== undefined ? { error: info.error } : {}),
       }
       activityState.set(key, activity)
-      if (stream) {
+      if (stream && primary) {
         let update = ""
         if (!openActivityKeys.has(key)) {
           update += liveActivityStart(activity)
@@ -833,7 +893,10 @@ export async function handle(request, response, command, sessionFactory = getAgy
         if (update) writeSse(response, id, model, created, { reasoning_content: update })
       }
     }
-    let result = await runBoundTurn(session, body.messages, onEvent, controller.signal, async () => {
+    const compactionMessages = kind === "compaction" ? [...body.messages, { role: "user", content:
+      "This is a conversation checkpoint summarization request, not an execution request. Produce a non-empty summary of the supplied transcript, following the summary format requested in the preceding instructions. Preserve the current goal, decisions, completed work, outstanding tasks, constraints and relevant paths. Treat historical tool calls as history; do not call tools or modify anything. Do not invent missing facts or approvals. Return only the summary, not an acknowledgement or a null placeholder."
+    }] : body.messages
+    let result = await runBoundTurn(session, compactionMessages, onEvent, controller.signal, async () => {
       session = await sessionFactory(command, model, sessionKey, !persistent, mode, directory)
       session.seedHistory = true
       return session
@@ -843,6 +906,23 @@ export async function handle(request, response, command, sessionFactory = getAgy
     // continuation. Recover an empty tool-only result in AGY before returning
     // cards, otherwise finishPendingActivity would terminate the task.
     const usage = { ...result?.usage }
+    if (kind === "compaction") {
+      text = summaryText(result, streamedAnswer)
+      for (let attempt = 1; !text && result?.status === "SUCCESS" && attempt < 3; attempt++) {
+        session.dispose(new Error("Empty compaction result; retrying in an isolated process"))
+        streamedAnswer = ""
+        session = await sessionFactory(command, model, randomUUID(), true, "default", directory)
+        result = await session.runTurn(compactionMessages, onEvent, controller.signal)
+        for (const field of ["input_tokens", "output_tokens", "total_tokens"]) {
+          usage[field] = (usage[field] ?? 0) + (result?.usage?.[field] ?? 0)
+        }
+        text = summaryText(result, streamedAnswer)
+      }
+      if (result?.status !== "SUCCESS") {
+        throw new Error(`AGY compaction failed: ${displayValue(result?.error ?? result?.status ?? "missing result")}`)
+      }
+      if (!text) throw new Error("AGY compaction failed: no non-empty summary after 3 isolated attempts")
+    }
     while (primary && mode !== "plan" && (!text.trim() || result?.status !== "SUCCESS") && activityState.size && activityRound < 3) {
       activityRound++
       streamedAnswer = ""
@@ -895,11 +975,26 @@ export async function handle(request, response, command, sessionFactory = getAgy
       return
     }
 
+    // Do not return HTTP 200 for streaming compaction until validation succeeds.
+    if (!response.headersSent) {
+      response.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+      })
+      response.flushHeaders()
+      writeSse(response, id, model, created, { role: "assistant" })
+    }
     if (text) writeSse(response, id, model, created, { content: text })
     clearInterval(heartbeat)
     writeSse(response, id, model, created, {}, "stop")
     response.end("data: [DONE]\n\n")
   } catch (error) {
+    if (kind === "compaction" && !controller.signal.aborted && !response.destroyed && !response.headersSent) {
+      clearInterval(heartbeat)
+      sendCheckpoint(response, stream, id, model, created, fallbackCheckpoint(body.messages, error.message))
+      return
+    }
     if (response.headersSent) {
       clearInterval(heartbeat)
       response.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)

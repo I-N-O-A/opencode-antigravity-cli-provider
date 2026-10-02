@@ -46,7 +46,9 @@ Tool failures remain visible as failed activity cards; they do not become provid
 
 Plan requests are never automatically continued by this recovery mechanism. The provider forwards OpenCode's request `kind`; compaction, title, and generate requests use isolated one-shot processes and do not emit display tool calls or contaminate the primary chat process. No keyword matching is used to infer compaction from ordinary user text.
 
-After updating, run `opencode service restart` to replace old in-memory bridge code. `/healthz` reports bridge version `5`; an older listener is rejected instead of silently reused. Regression tests: `node --test test/bridge.test.mjs`.
+Compaction must return a non-empty context checkpoint. Null, whitespace, non-text responses and literal null/undefined placeholders are rejected; valid streamed summary text can replace an empty result field. Up to three isolated attempts summarize the same supplied transcript with explicit summary-only instructions. Unexpected tool execution is stopped without replay. If summarization fails, the bridge builds a bounded local recovery checkpoint from this request's supplied history: system constraints, earlier user goals, recent dialogue and tool results/blockers. This is not an error-only placeholder, task-completion claim, or execution approval. Long excerpts are visibly shortened; missing facts must not be invented. Both JSON and streaming requests receive a valid checkpoint so OpenCode can continue the pending prompt rather than stopping on the summarization failure. Intentional cancellation/disconnection and invalid project/request validation are not overridden. The bridge does not directly edit OpenCode's transcript or guarantee lossless semantic recovery from an incomplete history.
+
+After updating, run `opencode service restart` to replace old in-memory bridge code. `/healthz` reports bridge version `7`; an older listener is rejected instead of silently reused. Regression tests: `node --test test/bridge.test.mjs`.
 
 ### Plan / Build transitions
 
