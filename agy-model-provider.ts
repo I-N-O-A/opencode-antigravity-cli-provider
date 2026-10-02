@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs"
-import { join } from "node:path"
+import { join, isAbsolute } from "node:path"
 import { spawn } from "node:child_process"
 
 const providerID = "agy-cli"
@@ -142,12 +142,21 @@ function parseModels(output: string) {
 export async function forwardSessionContext(ctx: any, event: any) {
   // Plugin load location may differ from the session (including worktrees
   // and moved sessions). Read the current session on every request.
-  const session = await ctx.session.get({ sessionID: event.sessionID })
-  const directory = session.location?.directory
-  if (typeof directory !== "string" || !directory) {
-    throw new Error("AGY request refused: OpenCode session has no project directory")
+  let directory: unknown
+  try {
+    const response = await ctx.session.get({ sessionID: event.sessionID })
+    const session = response?.data ?? response
+    directory = session?.location?.directory ?? session?.directory
+  } catch {
+    // A metadata lookup failure must not prevent project-independent prompts.
+    // Never substitute the plugin's load location or the service cwd.
+    console.warn("[agy-model-provider] Session directory unavailable; using isolated no-project context.")
   }
-  event.headers["x-opencode-directory"] = encodeURIComponent(directory)
+  if (typeof directory === "string" && isAbsolute(directory)) {
+    event.headers["x-opencode-directory"] = encodeURIComponent(directory)
+  } else {
+    delete event.headers["x-opencode-directory"]
+  }
   event.headers["x-opencode-session"] = event.sessionID
   event.headers["x-opencode-agent"] = event.agent
   event.headers["x-opencode-kind"] = event.kind

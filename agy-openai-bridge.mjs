@@ -6,7 +6,7 @@ import { spawn } from "node:child_process"
 import { createServer } from "node:http"
 
 const HOST = "127.0.0.1"
-const BRIDGE_VERSION = 7
+const BRIDGE_VERSION = 8
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
@@ -260,23 +260,25 @@ async function promptFrom(messages = [], attachmentDir, includeHistory = false) 
 }
 
 export function createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory = false, mode = "default", spawnProcess = spawn, directory, persistence = {}) {
-  if (!directory || !isAbsolute(directory)) throw new Error("AGY requires an explicit absolute project directory")
+  directory = typeof directory === "string" && isAbsolute(directory) ? directory : undefined
+  const workingDirectory = directory ?? attachmentDir
   const args = [
     "--model", model,
     "--add-dir", attachmentDir,
-    "--add-dir", directory,
+    ...(directory ? ["--add-dir", directory] : []),
     ...(persistence.conversationID ? ["--conversation", persistence.conversationID] : []),
     ...(mode === "plan" ? ["--mode=plan"] : []),
     "--input-format", "stream-json",
     "--output-format", "stream-json",
   ]
-  const child = spawnProcess(command, args, { cwd: directory, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
+  const child = spawnProcess(command, args, { cwd: workingDirectory, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
   agyChildren.add(child)
 
   const session = {
     key,
     model,
     directory,
+    workingDirectory,
     child,
     attachmentDir,
     stdout: "",
@@ -378,7 +380,9 @@ export function createAgySession(command, model, key, attachmentDir, includeHist
         // normal user request by words appearing in its transcript.
         const shouldIncludeHistory = includeHistory || session.seedHistory || isFirstTurnWithHistory
         const content = await promptFrom(messages, turnAttachmentDir, shouldIncludeHistory)
-        const prompt = primaryModePrompt(content, mode, !includeHistory)
+        const projectContext = directory ? "" :
+          "[Workspace context]\nNo project directory was supplied. You are running in an isolated temporary scratch directory, NOT a discovered user project. This is a supported state, not an error to retry. Do not search for or guess a project directory, and do not use another session's project. Continue project-independent tasks normally. Use explicit paths only when authorized by the user's request. If the task truly requires a project or relative file path, ask once for the needed path rather than looping.\n[End workspace context]\n\n"
+        const prompt = primaryModePrompt(projectContext + content, mode, !includeHistory)
         if (session.conversationID && persistence.store) await persistence.store.save(session.conversationID, false)
         session.seedHistory = false
         session.turnsCount++
@@ -415,6 +419,7 @@ export function createAgySession(command, model, key, attachmentDir, includeHist
 }
 
 async function getAgySession(command, model, key, includeHistory, mode = "default", directory) {
+  directory = typeof directory === "string" && isAbsolute(directory) ? directory : undefined
   let seedHistory = false
   const sessionPrefix = `${key.slice(0, key.lastIndexOf(":"))}:`
   for (const [otherKey, value] of agySessions) {
@@ -806,11 +811,18 @@ export async function handle(request, response, command, sessionFactory = getAgy
   let directory
   try {
     const encoded = request.headers["x-opencode-directory"]
-    if (typeof encoded !== "string" || !encoded) throw new Error("Missing OpenCode session directory; update the provider plugin")
-    const requested = decodeURIComponent(encoded)
-    if (!isAbsolute(requested) || /[\x00-\x1f]/.test(requested)) throw new Error("Invalid OpenCode session directory")
-    directory = await realpath(requested)
-    if (!(await stat(directory)).isDirectory()) throw new Error("OpenCode session path is not a directory")
+    if (typeof encoded === "string" && encoded) {
+      const requested = decodeURIComponent(encoded)
+      if (/[\x00-\x1f]/.test(requested)) throw new Error("Invalid OpenCode session directory header")
+      if (isAbsolute(requested)) {
+        try {
+          const resolved = await realpath(requested)
+          if ((await stat(resolved)).isDirectory()) directory = resolved
+        } catch (error) {
+          if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw error
+        }
+      }
+    }
   } catch (error) {
     sendJson(response, 400, { error: { message: `AGY request refused: ${error.message}` } })
     return

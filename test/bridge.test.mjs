@@ -209,8 +209,8 @@ test("real session adapter keeps stdin open after a tool failure and does not re
   } finally { session.dispose() }
 })
 
-for (const directory of ["", "relative/path", "%ZZ", encodeURIComponent(import.meta.filename)]) {
-  test(`invalid or missing project directory is refused: ${directory}`, async (t) => {
+for (const directory of ["%ZZ", "bad%00header"]) {
+  test(`malformed project directory header is refused: ${directory}`, async (t) => {
     const f = await fixture(t, [])
     const result = await f.post(user, false, { "x-opencode-directory": directory })
     assert.equal(result.status, 400)
@@ -245,7 +245,8 @@ test("provider uses current session location, not plugin location or a stale cac
   await forwardSessionContext(ctx, event)
   assert.equal(decodeURIComponent(event.headers["x-opencode-directory"]), directory)
   directory = undefined
-  await assert.rejects(forwardSessionContext(ctx, event), /no project directory/)
+  await forwardSessionContext(ctx, event)
+  assert.equal(event.headers["x-opencode-directory"], undefined)
 })
 
 test("display acknowledgement cannot cross project boundaries", async (t) => {
@@ -465,4 +466,56 @@ test("primary prompt can continue after recovered compaction without a provider 
   assert.equal(f.inputs.length, 2)
   assert.equal(f.factories[0][3], true)
   assert.equal(f.factories[1][3], false)
+})
+
+for (const directory of ["", "relative/path", encodeURIComponent(import.meta.filename), encodeURIComponent(join(tmpdir(), "nonexistent-agy-project-123456789"))]) {
+  test(`unavailable project directory allows a single no-project turn: ${directory}`, async (t) => {
+    const f = await fixture(t, [{ result: { status: "SUCCESS", response: "Task answered without a project." } }])
+    const result = await f.post(user, false, { "x-opencode-directory": directory })
+    assert.equal(result.status, 200)
+    assert.equal(f.factories[0][5], undefined)
+    assert.equal(f.inputs.length, 1)
+    assert.equal(result.body.choices[0].message.content, "Task answered without a project.")
+  })
+}
+
+test("no-project process uses its own scratch cwd, never the service cwd, and explains missing context", async () => {
+  const child = new EventEmitter()
+  Object.assign(child, { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), exitCode: null,
+    killed: false, kill() { this.killed = true; this.emit("close", 0) } })
+  const scratch = await mkdtemp(join(tmpdir(), "agy-no-project-test-"))
+  let launched, sent
+  child.stdin.on("data", (data) => {
+    sent = JSON.parse(data.toString()).message.content
+    queueMicrotask(() => child.stdout.write(`${JSON.stringify({ event: "result", result: { status: "SUCCESS", response: "OK" } })}\n`))
+  })
+  const session = createAgySession("mock", "model", "key", scratch, false, false, "default", (cmd, args, options) => {
+    launched = { args, options }
+    return child
+  })
+  try {
+    const result = await session.runTurn([{ role: "user", content: "Answer a general question." }])
+    assert.equal(result.response, "OK")
+    assert.equal(launched.options.cwd, scratch)
+    assert.notEqual(launched.options.cwd, process.cwd())
+    assert.equal(launched.args.filter((argument) => argument === "--add-dir").length, 1)
+    assert.ok(!launched.args.includes(undefined))
+    assert.match(sent, /No project directory was supplied/)
+    assert.match(sent, /ask once/)
+    assert.match(sent, /Do not search for or guess/)
+  } finally { session.dispose() }
+})
+
+test("provider supports wrapped and legacy session metadata without falling back to plugin cwd", async () => {
+  const event = { sessionID: "ses-test", headers: {}, agent: "build", kind: "primary" }
+  const ctx = { location: { directory: process.cwd() }, session: { get: async () => ({ data: { location: { directory: process.cwd() } } }) } }
+  await forwardSessionContext(ctx, event)
+  assert.equal(decodeURIComponent(event.headers["x-opencode-directory"]), process.cwd())
+  ctx.session.get = async () => ({ directory: process.cwd() })
+  await forwardSessionContext(ctx, event)
+  assert.equal(decodeURIComponent(event.headers["x-opencode-directory"]), process.cwd())
+  ctx.session.get = async () => { throw new Error("Metadata lookup unavailable") }
+  await forwardSessionContext(ctx, event)
+  assert.equal(event.headers["x-opencode-directory"], undefined)
+  assert.equal(event.headers["x-opencode-session"], "ses-test")
 })
