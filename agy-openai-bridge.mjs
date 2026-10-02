@@ -1,14 +1,16 @@
-import { randomUUID } from "node:crypto"
-import { mkdtemp, open, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { extname, join } from "node:path"
+import { randomUUID, createHash } from "node:crypto"
+import { mkdtemp, open, rm, realpath, stat, mkdir, readFile, writeFile, rename } from "node:fs/promises"
+import { tmpdir, homedir } from "node:os"
+import { extname, join, isAbsolute } from "node:path"
 import { spawn } from "node:child_process"
 import { createServer } from "node:http"
 
 const HOST = "127.0.0.1"
+const BRIDGE_VERSION = 5
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
+const listeners = new Set()
 const agySessions = new Map()
 const agyChildren = new Set()
 const pendingActivities = new Map()
@@ -18,7 +20,53 @@ let monitorHistoryBytes = 0
 let monitorEnabled = false
 const MONITOR_HISTORY_LIMIT = 250
 const MONITOR_HISTORY_BYTES = 4 * 1024 * 1024
-const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function conversationStore(command, key, directory) {
+  const owner = JSON.stringify([command, key, directory])
+  const root = process.env.AGY_BRIDGE_STATE_DIR ?? join(homedir(), ".local", "state", "opencode", "agy-bridge", "conversations")
+  const path = join(root, `${createHash("sha256").update(owner).digest("hex")}.json`)
+  return {
+    async load() {
+      try {
+        const saved = JSON.parse(await readFile(path, "utf8"))
+        return saved.owner === owner && saved.clean === true && CONVERSATION_ID.test(saved.conversationID ?? "") ? saved.conversationID : undefined
+      } catch (error) {
+        if (error.code !== "ENOENT") console.warn("[agy-openai-bridge] Invalid conversation mapping; using this session's supplied history:", error.message)
+      }
+    },
+    async save(conversationID, clean) {
+      if (!CONVERSATION_ID.test(conversationID ?? "")) throw new Error("Invalid AGY conversation ID")
+      await mkdir(root, { recursive: true })
+      const temporary = `${path}.${randomUUID()}.tmp`
+      try {
+        await writeFile(temporary, JSON.stringify({ owner, conversationID, clean }), { mode: 0o600 })
+        await rename(temporary, path)
+      } finally { await rm(temporary, { force: true }).catch(() => {}) }
+    },
+    async clear() { await rm(path, { force: true }) },
+  }
+}
+
+export class ConversationMismatch extends Error {}
+
+export async function runBoundTurn(session, messages, onEvent, signal, freshSession) {
+  let toolStarted = false
+  try {
+    return await session.runTurn(messages, (event) => {
+      if (event.step_update?.step_type === "tool") toolStarted = true
+      onEvent(event)
+    }, signal)
+  } catch (error) {
+    // Only a rejected conversation identity may fall back, and never after
+    // tool work or cancellation. Transport/auth errors must not replay actions.
+    if (!(error instanceof ConversationMismatch) || toolStarted || signal?.aborted) throw error
+    session.dispose(error)
+    await session.persistenceStore?.clear()
+    const fresh = await freshSession()
+    return fresh.runTurn(messages, onEvent, signal)
+  }
+}
 
 function publishMonitor(direction, payload) {
   if (!monitorEnabled) return
@@ -166,7 +214,9 @@ async function promptFrom(messages = [], attachmentDir, includeHistory = false) 
   const message = [...messages].reverse().find((item) => item.role === "user")
   if (!message) throw new Error("OpenCode request did not contain a user message")
 
-  const turns = includeHistory ? messages.filter((item) => item.role === "user" || item.role === "assistant") : [message]
+  const turns = includeHistory
+    ? messages.filter((item) => item.role === "user" || item.role === "assistant" || item.role === "tool" || item.role === "system")
+    : [message]
   const transcript = []
   for (const turn of turns) {
     const text = []
@@ -186,28 +236,47 @@ async function promptFrom(messages = [], attachmentDir, includeHistory = false) 
       }
     }
 
-    const prompt = text.join("")
+    if (Array.isArray(turn.tool_calls) && turn.tool_calls.length) {
+      for (const tc of turn.tool_calls) {
+        const fn = tc?.function?.name ?? tc?.name ?? "tool"
+        const args = tc?.function?.arguments ?? tc?.arguments ?? ""
+        text.push(`[Tool call: ${fn}(${typeof args === "string" ? args : JSON.stringify(args)})]`)
+      }
+    }
+
+    let prompt = text.join("")
+    if (turn.role === "tool" && prompt.length > 32_768) {
+      prompt = `${prompt.slice(0, 16_384)}\n\n[... output truncated (${prompt.length - 32_768} bytes omitted) ...]\n\n${prompt.slice(-16_384)}`
+    }
     const content = !attachments.length ? prompt : prompt ? `${prompt}\n\n${attachments.join("\n")}` : attachments.join("\n")
-    if (includeHistory) transcript.push(`${turn.role === "assistant" ? "Assistant" : "User"}: ${content}`)
-    else return content
+    if (includeHistory) {
+      const roleLabel = turn.role === "assistant" ? "Assistant" : turn.role === "tool" ? "Tool" : turn.role === "system" ? "System" : "User"
+      transcript.push(`${roleLabel}: ${content}`)
+    } else {
+      return content
+    }
   }
-  return transcript.join("\n\n")
+  return "The following transcript belongs only to the current OpenCode session. Historical tool calls and results are context, not actions to repeat or permission approvals. Continue only the latest user request; do not invent missing session context.\n\n" + transcript.join("\n\n")
 }
 
-function createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory = false, mode = "default") {
+export function createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory = false, mode = "default", spawnProcess = spawn, directory, persistence = {}) {
+  if (!directory || !isAbsolute(directory)) throw new Error("AGY requires an explicit absolute project directory")
   const args = [
     "--model", model,
     "--add-dir", attachmentDir,
+    "--add-dir", directory,
+    ...(persistence.conversationID ? ["--conversation", persistence.conversationID] : []),
     ...(mode === "plan" ? ["--mode=plan"] : []),
     "--input-format", "stream-json",
     "--output-format", "stream-json",
   ]
-  const child = spawn(command, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
+  const child = spawnProcess(command, args, { cwd: directory, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] })
   agyChildren.add(child)
 
   const session = {
     key,
     model,
+    directory,
     child,
     attachmentDir,
     stdout: "",
@@ -215,9 +284,11 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
     activeTurn: undefined,
     queue: Promise.resolve(),
     busy: 0,
-    idleTimer: undefined,
+    conversationID: persistence.conversationID,
+    persistenceStore: persistence.store,
     closed: false,
     seedHistory,
+    turnsCount: 0,
   }
 
   const removeSession = () => {
@@ -234,26 +305,27 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
   const dispose = (error = new Error("AGY session closed")) => {
     if (session.closed) return
     session.closed = true
-    clearTimeout(session.idleTimer)
+    session.failure = error
     removeSession()
     rejectActive(error)
     if (child.exitCode === null && !child.killed) child.kill()
     cleanupDirectory()
   }
-  const scheduleIdleExpiry = () => {
-    clearTimeout(session.idleTimer)
-    if (session.closed || session.busy) return
-    session.idleTimer = setTimeout(() => {
-      if (!session.busy) dispose(new Error("AGY chat process expired after two hours idle; start a new chat turn"))
-    }, SESSION_IDLE_TIMEOUT_MS)
-    session.idleTimer.unref?.()
-  }
-
   const handleLine = (line, wireLine) => {
     if (!line.trim()) return
     publishMonitor("AGY stdout → Bridge", { line: wireLine })
     let event
     try { event = JSON.parse(line) } catch { return }
+    // AGY silently starts a NEW conversation if --conversation was not found.
+    // Reject that init before processing any tools or accepting its answer.
+    const conversationID = event.conversation_id ?? event.init?.conversation_id ?? event.result?.conversation_id ?? event.step_update?.conversation_id
+    if (conversationID) {
+      if (session.conversationID && session.conversationID !== conversationID) {
+        dispose(new ConversationMismatch("AGY did not resume the conversation bound to this OpenCode session"))
+        return
+      }
+      session.conversationID = conversationID
+    }
     const turn = session.activeTurn
     if (!turn) return
     try { turn.onEvent(event) } catch (error) {
@@ -264,7 +336,6 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
       session.activeTurn = undefined
       turn.signal?.removeEventListener("abort", turn.abort)
       turn.resolve(event.result)
-      if (includeHistory) child.stdin.end()
     }
   }
 
@@ -287,7 +358,6 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
     const error = new Error(session.stderr.trim() || `agy chat process exited with code ${code}`)
     if (!session.closed) {
       session.closed = true
-      clearTimeout(session.idleTimer)
       removeSession()
       rejectActive(error)
       cleanupDirectory()
@@ -297,14 +367,21 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
   session.dispose = dispose
   session.runTurn = (messages, onEvent = () => {}, signal) => {
     session.busy++
-    clearTimeout(session.idleTimer)
     const turn = session.queue.then(async () => {
-      if (session.closed) throw new Error("AGY chat process is no longer available; start a new chat turn")
+      if (session.closed) throw session.failure ?? new Error("AGY chat process is no longer available; start a new chat turn")
       if (signal?.aborted) throw signal.reason ?? new Error("Request aborted")
       const turnAttachmentDir = await mkdtemp(join(attachmentDir, "turn-"))
       try {
-        const prompt = await promptFrom(messages, turnAttachmentDir, includeHistory || session.seedHistory)
+        const meaningfulTurns = messages.filter((item) => item.role === "user" || item.role === "assistant" || item.role === "tool")
+        const isFirstTurnWithHistory = session.turnsCount === 0 && meaningfulTurns.length > 1
+        // Auxiliary requests use a separate one-shot session. Never classify a
+        // normal user request by words appearing in its transcript.
+        const shouldIncludeHistory = includeHistory || session.seedHistory || isFirstTurnWithHistory
+        const content = await promptFrom(messages, turnAttachmentDir, shouldIncludeHistory)
+        const prompt = primaryModePrompt(content, mode, !includeHistory)
+        if (session.conversationID && persistence.store) await persistence.store.save(session.conversationID, false)
         session.seedHistory = false
+        session.turnsCount++
         const result = await new Promise((resolve, reject) => {
           if (session.closed) {
             reject(new Error("AGY chat process is no longer available"))
@@ -320,7 +397,10 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
             if (error) dispose(error)
           })
         })
-        if (result?.status !== "SUCCESS") throw new Error(result?.error || `agy finished with status ${result?.status ?? "unknown"}`)
+        if (result?.status !== "SUCCESS") {
+          console.warn(`[agy-openai-bridge] AGY turn finished with non-success status: ${result?.status ?? "unknown"}, error: ${result?.error ?? "none"}`)
+        }
+        if (session.conversationID && persistence.store) await persistence.store.save(session.conversationID, true)
         return result
       } finally {
         await rm(turnAttachmentDir, { recursive: true, force: true })
@@ -329,34 +409,38 @@ function createAgySession(command, model, key, attachmentDir, includeHistory, se
     session.queue = turn.catch(() => {})
     return turn.finally(() => {
       session.busy--
-      if (!session.closed) scheduleIdleExpiry()
     })
   }
-  scheduleIdleExpiry()
   return session
 }
 
-async function getAgySession(command, model, key, includeHistory, mode = "default") {
-  const existing = agySessions.get(key)
-  if (existing) {
-    const session = await existing
-    if (!session.closed) return session
-  }
-
+async function getAgySession(command, model, key, includeHistory, mode = "default", directory) {
   let seedHistory = false
   const sessionPrefix = `${key.slice(0, key.lastIndexOf(":"))}:`
   for (const [otherKey, value] of agySessions) {
     if (otherKey === key || !otherKey.startsWith(sessionPrefix)) continue
     const previous = await value
     if (!previous.closed) {
-      seedHistory = true
-      if (previous.busy === 0) previous.dispose(new Error("AGY execution mode changed; starting a session with the new mode"))
+      seedHistory = previous.directory === directory
+      previous.dispose(new Error("AGY execution mode or directory changed; stopping the old mode process"))
     }
   }
+  const existing = agySessions.get(key)
+  if (existing) {
+    const session = await existing
+    if (!session.closed && session.directory === directory) {
+      session.seedHistory ||= seedHistory
+      return session
+    }
+    if (!session.closed) session.dispose(new Error("OpenCode session directory changed; stopping the old AGY process"))
+  }
 
-  const creating = mkdtemp(join(tmpdir(), "agy-session-attachments-")).then((attachmentDir) =>
-    createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory, mode),
-  )
+  const creating = (async () => {
+    const store = !includeHistory ? conversationStore(command, key, directory) : undefined
+    const conversationID = await store?.load()
+    const attachmentDir = await mkdtemp(join(tmpdir(), "agy-session-attachments-"))
+    return createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory, mode, spawn, directory, { conversationID, store })
+  })()
   agySessions.set(key, creating)
   try {
     const session = await creating
@@ -396,9 +480,19 @@ function writeSse(response, id, model, created, delta, finishReason = null) {
   response.write(`data: ${JSON.stringify(outgoing)}\n\n`)
 }
 
-function openCodeMode(headers = {}) {
+export function openCodeMode(headers = {}) {
   const agent = String(headers["x-opencode-agent"] ?? "").trim().toLowerCase()
+  // The selected OpenCode agent is authoritative. A quoted /plan command or
+  // checkpoint must never override an explicit Build request.
   return agent === "plan" ? "plan" : "default"
+}
+
+export function primaryModePrompt(content, mode, primary) {
+  if (!primary) return content
+  const state = mode === "plan"
+    ? "OpenCode's CURRENT selected agent is Plan. Plan-only restrictions are active: do not implement changes or assume approval. Wait for an explicit mode switch and user authorization."
+    : "OpenCode's CURRENT selected agent is not Plan (execution mode). Earlier messages saying that you remain in Plan mode or asking the user to switch agents describe a PREVIOUS state, not the current state. Do not ask the user to switch from Plan when they have already switched. Continue the latest authorized user task; switching modes alone is not approval for unrelated actions or a plan the user has not authorized. Existing tool permissions and other safety instructions remain in force."
+  return `[Current OpenCode session state]\n${state}\n[End current state]\n\n${content}\n\n[Current state reminder]\n${state}`
 }
 
 const ACTIVITY_TOOL_NAMES = new Map([
@@ -477,16 +571,21 @@ function activityToolCalls(activities, advertisedTools) {
 function activityGroupFromMessages(messages = []) {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index]
+    if (message.role !== "tool") break
     if (message.role !== "tool" || typeof message.tool_call_id !== "string") continue
     const match = /^agy-([0-9a-f-]+)-\d+$/i.exec(message.tool_call_id)
     if (match) return match[1]
   }
 }
 
-function finishPendingActivity(body, response, model, id, created, stream) {
+function finishPendingActivity(body, response, model, id, created, stream, directory, sessionId) {
   const group = activityGroupFromMessages(body.messages)
   const pending = group && pendingActivities.get(group)
   if (!pending) return false
+  if (pending.directory !== directory || pending.sessionId !== sessionId || pending.model !== model) {
+    sendJson(response, 409, { error: { message: "AGY activity acknowledgement belongs to a different session, model or project directory" } })
+    return true
+  }
   const received = new Set((body.messages ?? [])
     .filter((message) => message.role === "tool" && typeof message.tool_call_id === "string")
     .map((message) => message.tool_call_id))
@@ -495,6 +594,9 @@ function finishPendingActivity(body, response, model, id, created, stream) {
     return true
   }
   pendingActivities.delete(group)
+
+  const finalText = pending.text
+
   if (stream) {
     response.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
@@ -503,7 +605,7 @@ function finishPendingActivity(body, response, model, id, created, stream) {
     })
     response.flushHeaders()
     writeSse(response, id, model, created, { role: "assistant" })
-    if (pending.text) writeSse(response, id, model, created, { content: pending.text })
+    writeSse(response, id, model, created, { content: finalText })
     writeSse(response, id, model, created, {}, "stop")
     response.end("data: [DONE]\n\n")
   } else {
@@ -512,16 +614,19 @@ function finishPendingActivity(body, response, model, id, created, stream) {
       object: "chat.completion",
       created,
       model,
-      choices: [{ index: 0, message: { role: "assistant", content: pending.text }, finish_reason: "stop" }],
+      choices: [{ index: 0, message: { role: "assistant", content: finalText }, finish_reason: "stop" }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     })
   }
   return true
 }
 
-function sendActivityToolCalls(response, stream, model, id, created, result, toolCallData) {
+function sendActivityToolCalls(response, stream, model, id, created, result, toolCallData, directory, sessionId) {
   const { group, toolCalls } = toolCallData
   pendingActivities.set(group, {
+    directory,
+    sessionId,
+    model,
     text: result.response ?? "",
     toolCallIds: toolCalls.map((toolCall) => toolCall.id),
     createdAt: Date.now(),
@@ -557,7 +662,7 @@ function sendActivityToolCalls(response, stream, model, id, created, result, too
   })
 }
 
-async function handle(request, response, command) {
+export async function handle(request, response, command, sessionFactory = getAgySession) {
   // Keep the API closed to browsers; only the exact same-origin monitor page
   // may read events or toggle capture. The listener itself is loopback-only.
   const monitorRoute = request.url === "/monitor" || request.url === "/monitor/" || request.url === "/monitor/events"
@@ -606,7 +711,7 @@ async function handle(request, response, command) {
     return
   }
   if (request.method === "GET" && request.url === "/healthz") {
-    sendJson(response, 200, { service: "agy-openai-bridge", version: 1 })
+    sendJson(response, 200, { service: "agy-openai-bridge", version: BRIDGE_VERSION })
     return
   }
   if (request.method === "GET" && request.url === "/v1/models") {
@@ -639,15 +744,28 @@ async function handle(request, response, command) {
   const stream = Boolean(body.stream)
   const id = `chatcmpl-${randomUUID()}`
   const created = Math.floor(Date.now() / 1000)
+  let directory
+  try {
+    const encoded = request.headers["x-opencode-directory"]
+    if (typeof encoded !== "string" || !encoded) throw new Error("Missing OpenCode session directory; update the provider plugin")
+    const requested = decodeURIComponent(encoded)
+    if (!isAbsolute(requested) || /[\x00-\x1f]/.test(requested)) throw new Error("Invalid OpenCode session directory")
+    directory = await realpath(requested)
+    if (!(await stat(directory)).isDirectory()) throw new Error("OpenCode session path is not a directory")
+  } catch (error) {
+    sendJson(response, 400, { error: { message: `AGY request refused: ${error.message}` } })
+    return
+  }
   const now = Date.now()
   for (const [key, pending] of pendingActivities) {
     if (now - pending.createdAt > 30 * 60 * 1000) pendingActivities.delete(key)
   }
-  if (finishPendingActivity(body, response, model, id, created, stream)) return
-
   const sessionId = request.headers["x-opencode-session"]
-  const persistent = typeof sessionId === "string" && sessionId.length > 0
-  const mode = openCodeMode(request.headers)
+  if (finishPendingActivity(body, response, model, id, created, stream, directory, sessionId)) return
+  const kind = String(request.headers["x-opencode-kind"] ?? "primary")
+  const primary = kind === "primary"
+  const persistent = primary && typeof sessionId === "string" && sessionId.length > 0
+  const mode = primary ? openCodeMode(request.headers) : "default"
   const sessionKey = persistent ? `${sessionId}:${model}:${mode}` : randomUUID()
   const controller = new AbortController()
   response.once("close", () => {
@@ -676,8 +794,9 @@ async function handle(request, response, command) {
   }
 
   try {
-    session = await getAgySession(command, model, sessionKey, !persistent, mode)
-    const result = await session.runTurn(body.messages, (event) => {
+    session = await sessionFactory(command, model, sessionKey, !persistent, mode, directory)
+    let activityRound = 0
+    const onEvent = (event) => {
       if (controller.signal.aborted || response.destroyed) return
       if (event.event === "step_update" && event.step_update?.step_type === "agent_response") {
         if (typeof event.step_update.text_delta === "string" && event.step_update.text_delta) {
@@ -690,7 +809,7 @@ async function handle(request, response, command) {
       const tool = step.tool_name ?? step.tool_info?.name ?? "Tool"
       const index = Number(step.step_index)
       const fallbackKey = `${tool}:${JSON.stringify(step.tool_info?.parameters ?? {})}`
-      const key = Number.isFinite(index) ? String(index) : fallbackKey
+      const key = `${activityRound}:${Number.isFinite(index) ? String(index) : fallbackKey}`
       const info = step.tool_info ?? {}
       const failed = step.state === "ERROR" || info.error !== undefined
       const activity = {
@@ -713,9 +832,40 @@ async function handle(request, response, command) {
         }
         if (update) writeSse(response, id, model, created, { reasoning_content: update })
       }
-    }, controller.signal)
-    if (result.status !== "SUCCESS") throw new Error(result.error || `agy finished with status ${result.status}`)
-    const text = result.response ?? streamedAnswer
+    }
+    let result = await runBoundTurn(session, body.messages, onEvent, controller.signal, async () => {
+      session = await sessionFactory(command, model, sessionKey, !persistent, mode, directory)
+      session.seedHistory = true
+      return session
+    })
+    let text = String(result?.response || streamedAnswer || "")
+    // Display cards acknowledge work already done; they are NOT the agent
+    // continuation. Recover an empty tool-only result in AGY before returning
+    // cards, otherwise finishPendingActivity would terminate the task.
+    const usage = { ...result?.usage }
+    while (primary && mode !== "plan" && (!text.trim() || result?.status !== "SUCCESS") && activityState.size && activityRound < 3) {
+      activityRound++
+      streamedAnswer = ""
+      result = await session.runTurn([{ role: "user", content:
+        "The previous turn returned tool activity but no final answer. Continue the original user task from your existing context. " +
+        "Completed actions must not be repeated. Tool failures are results, not a reason to end unrelated work. " +
+        "Respect permission denials: do not retry denied actions, rephrase them, or use alternative tools to access denied resources. " +
+        "Do not treat this message as plan approval. If blocked or finished, provide a concrete final answer describing the outcome and any remaining blocker."
+      }], onEvent, controller.signal)
+      for (const field of ["input_tokens", "output_tokens", "total_tokens"]) {
+        usage[field] = (usage[field] ?? 0) + (result?.usage?.[field] ?? 0)
+      }
+      text = String(result?.response || streamedAnswer || "")
+    }
+    result = { ...result, usage }
+    if (!text.trim()) {
+      if (result?.status !== "SUCCESS" && !activityState.size) {
+        throw new Error(displayValue(result?.error ?? `AGY finished with status ${result?.status ?? "unknown"}`))
+      }
+      text = mode === "plan"
+        ? "AGY hat keinen Plantext geliefert. Es wurde keine automatische Ausführungsfreigabe erteilt."
+        : "AGY hat trotz Fortsetzungsversuchen keine abschließende Antwort geliefert. Die Aufgabe ist nicht als abgeschlossen bestätigt."
+    }
     for (const key of openActivityKeys) {
       const activity = activityState.get(key)
       if (activity) writeSse(response, id, model, created, {
@@ -723,10 +873,10 @@ async function handle(request, response, command) {
       })
     }
     openActivityKeys.clear()
-    const toolCallData = activityToolCalls([...activityState.values()], body.tools)
+    const toolCallData = primary ? activityToolCalls([...activityState.values()], body.tools) : undefined
     if (toolCallData) {
       clearInterval(heartbeat)
-      sendActivityToolCalls(response, stream, model, id, created, { ...result, response: text }, toolCallData)
+      sendActivityToolCalls(response, stream, model, id, created, { ...result, response: text }, toolCallData, directory, sessionId)
       return
     }
     if (!stream) {
@@ -775,7 +925,7 @@ export function startBridge(command) {
         fetch(`http://${HOST}:${PORT}/healthz`, { signal: AbortSignal.timeout(1500) })
           .then(async (response) => {
             const health = await response.json()
-            if (!response.ok || health.service !== "agy-openai-bridge" || health.version !== 1) {
+            if (!response.ok || health.service !== "agy-openai-bridge" || health.version !== BRIDGE_VERSION) {
               throw new Error("another service is using the agy bridge port")
             }
             resolve()
@@ -786,6 +936,7 @@ export function startBridge(command) {
       }
     })
     server.listen(PORT, HOST, () => {
+      listeners.add(server)
       server.unref()
       servers.set(command, ready)
       resolve()
@@ -793,4 +944,19 @@ export function startBridge(command) {
   })
   servers.set(command, ready)
   return ready
+}
+
+// Await process shutdown instead of killing children from inside process.exit.
+export async function stopBridge() {
+  const closed = [...agyChildren].map((child) => new Promise((resolve) => child.once("close", resolve)))
+  for (const value of agySessions.values()) (await value).dispose()
+  for (const child of agyChildren) if (!child.killed) child.kill()
+  await Promise.all(closed)
+  await Promise.all([...listeners].map((server) => new Promise((resolve) => {
+    server.close(resolve)
+    server.closeAllConnections()
+  })))
+  listeners.clear()
+  servers.clear()
+  pendingActivities.clear()
 }

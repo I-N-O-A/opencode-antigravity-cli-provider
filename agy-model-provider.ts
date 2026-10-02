@@ -139,16 +139,27 @@ function parseModels(output: string) {
   return [...models].map(([id, name]) => ({ id, name }))
 }
 
+export async function forwardSessionContext(ctx: any, event: any) {
+  // Plugin load location may differ from the session (including worktrees
+  // and moved sessions). Read the current session on every request.
+  const session = await ctx.session.get({ sessionID: event.sessionID })
+  const directory = session.location?.directory
+  if (typeof directory !== "string" || !directory) {
+    throw new Error("AGY request refused: OpenCode session has no project directory")
+  }
+  event.headers["x-opencode-directory"] = encodeURIComponent(directory)
+  event.headers["x-opencode-session"] = event.sessionID
+  event.headers["x-opencode-agent"] = event.agent
+  event.headers["x-opencode-kind"] = event.kind
+}
+
 export default {
   id: "agy-model-provider",
   async setup(ctx) {
     const command = agyCommand()
     const { startBridge } = await import("../runtime/agy-openai-bridge.mjs")
     await startBridge(command)
-    await ctx.session.hook("model.request", (event) => {
-      event.headers["x-opencode-session"] = event.sessionID
-      event.headers["x-opencode-agent"] = event.agent
-    }, { providerID })
+    await ctx.session.hook("model.request", (event) => forwardSessionContext(ctx, event), { providerID })
     await ctx.command.transform((editor) => {
       editor.add({
         name: "agy-monitor-on",
