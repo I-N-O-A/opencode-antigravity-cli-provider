@@ -4,15 +4,50 @@ import { tmpdir, homedir } from "node:os"
 import { extname, join, isAbsolute } from "node:path"
 import { spawn } from "node:child_process"
 import { createServer } from "node:http"
+import { accountIdentity, retireMismatchedSessions } from "./agy-account-sync.mjs"
 
 const HOST = "127.0.0.1"
-const BRIDGE_VERSION = 8
+const BRIDGE_VERSION = 9
 const PORT = Number(process.env.AGY_BRIDGE_PORT ?? 47381)
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error("AGY_BRIDGE_PORT must be an integer from 1024 to 65535")
 const servers = new Map()
 const listeners = new Set()
 const agySessions = new Map()
 const agyChildren = new Set()
+let accountSyncPromise
+let accountSyncTimer
+let desktopAccount
+let accountSyncError
+
+function syncDesktopAccount() {
+  if (accountSyncPromise) return accountSyncPromise
+  accountSyncPromise = (async () => {
+    try {
+      let identity = await accountIdentity()
+      if (!identity.enabled) {
+        desktopAccount = undefined
+        accountSyncError = undefined
+        return identity
+      }
+      await retireMismatchedSessions([...agySessions.values()], identity.accountId,
+        !identity.credentialMatches || identity.processesNeedRestart)
+      if (!identity.credentialMatches || identity.processesNeedRestart) identity = await accountIdentity(true)
+      if (!identity.credentialMatches) throw new Error("AGY login does not match the desktop account")
+      if (desktopAccount?.accountId !== identity.accountId || identity.repaired) {
+        console.log(`[agy-openai-bridge] Desktop account synchronized: ${identity.email}`)
+      }
+      desktopAccount = identity
+      accountSyncError = undefined
+      return identity
+    } catch (error) {
+      desktopAccount = undefined
+      accountSyncError = error.message
+      await retireMismatchedSessions([...agySessions.values()], undefined, true)
+      throw error
+    }
+  })().finally(() => { accountSyncPromise = undefined })
+  return accountSyncPromise
+}
 const pendingActivities = new Map()
 const monitorClients = new Set()
 const monitorHistory = []
@@ -276,6 +311,7 @@ export function createAgySession(command, model, key, attachmentDir, includeHist
 
   const session = {
     key,
+    accountId: persistence.accountId,
     model,
     directory,
     workingDirectory,
@@ -370,6 +406,10 @@ export function createAgySession(command, model, key, attachmentDir, includeHist
   session.runTurn = (messages, onEvent = () => {}, signal) => {
     session.busy++
     const turn = session.queue.then(async () => {
+      if (session.accountId) {
+        const identity = await syncDesktopAccount()
+        if (identity.accountId !== session.accountId) throw new Error("Antigravity account changed before request")
+      }
       if (session.closed) throw session.failure ?? new Error("AGY chat process is no longer available; start a new chat turn")
       if (signal?.aborted) throw signal.reason ?? new Error("Request aborted")
       const turnAttachmentDir = await mkdtemp(join(attachmentDir, "turn-"))
@@ -419,6 +459,7 @@ export function createAgySession(command, model, key, attachmentDir, includeHist
 }
 
 async function getAgySession(command, model, key, includeHistory, mode = "default", directory) {
+  const identity = await syncDesktopAccount()
   directory = typeof directory === "string" && isAbsolute(directory) ? directory : undefined
   let seedHistory = false
   const sessionPrefix = `${key.slice(0, key.lastIndexOf(":"))}:`
@@ -444,7 +485,7 @@ async function getAgySession(command, model, key, includeHistory, mode = "defaul
     const store = !includeHistory ? conversationStore(command, key, directory) : undefined
     const conversationID = await store?.load()
     const attachmentDir = await mkdtemp(join(tmpdir(), "agy-session-attachments-"))
-    return createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory, mode, spawn, directory, { conversationID, store })
+    return createAgySession(command, model, key, attachmentDir, includeHistory, seedHistory, mode, spawn, directory, { conversationID, store, accountId: identity.accountId })
   })()
   agySessions.set(key, creating)
   try {
@@ -775,7 +816,9 @@ export async function handle(request, response, command, sessionFactory = getAgy
     return
   }
   if (request.method === "GET" && request.url === "/healthz") {
-    sendJson(response, 200, { service: "agy-openai-bridge", version: BRIDGE_VERSION })
+    sendJson(response, 200, { service: "agy-openai-bridge", version: BRIDGE_VERSION,
+      account: desktopAccount?.email, accountSynchronized: Boolean(desktopAccount),
+      accountSyncError, cliSessions: agySessions.size })
     return
   }
   if (request.method === "GET" && request.url === "/v1/models") {
@@ -1043,6 +1086,11 @@ export function startBridge(command) {
       }
     })
     server.listen(PORT, HOST, () => {
+      if (!accountSyncTimer) {
+        accountSyncTimer = setInterval(() => { void syncDesktopAccount().catch(() => {}) }, 1000)
+        accountSyncTimer.unref()
+        void syncDesktopAccount().catch(() => {})
+      }
       listeners.add(server)
       server.unref()
       servers.set(command, ready)
@@ -1055,6 +1103,8 @@ export function startBridge(command) {
 
 // Await process shutdown instead of killing children from inside process.exit.
 export async function stopBridge() {
+  clearInterval(accountSyncTimer)
+  accountSyncTimer = undefined
   const closed = [...agyChildren].map((child) => new Promise((resolve) => child.once("close", resolve)))
   for (const value of agySessions.values()) (await value).dispose()
   for (const child of agyChildren) if (!child.killed) child.kill()
